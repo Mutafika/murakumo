@@ -1,0 +1,21 @@
+[package]
+name = "murakumo-gallery"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+murakumo = { path = "../murakumo" }
+sabitori = { path = "../../../sabitori/crates/sabitori" }
+sabitori-style = { path = "../../../sabitori/crates/sabitori-style" }
+sabitori-widgets = { path = "../../../sabitori/crates/sabitori-widgets" }
+sabitori-input = { path = "../../../sabitori/crates/sabitori-input" }
+seimei = { path = "../../../seimei", default-features = false }
+wgpu = { version = "24", features = ["webgl"] }
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+web-time = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window"] }
+wasm-bindgen = "0.2"

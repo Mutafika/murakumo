@@ -1,0 +1,12 @@
+[package]
+name = "murakumo"
+version = "0.1.0"
+edition = "2024"
+description = "Seimei上のマテリアル/エフェクト集 — 叢雲"
+license = "MIT"
+
+[dependencies]
+seimei = { path = "../../../seimei", default-features = false }
+wgpu = "24"
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
