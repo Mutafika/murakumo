@@ -90,6 +90,31 @@ fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
 
 const BLOOM_INTENSITY: f32 = 0.25;
 
+// Color grading: lift shadows toward blue, push highlights warm
+fn color_grade(color: vec3<f32>) -> vec3<f32> {
+    let lum = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+
+    // Shadow lift — add subtle blue to dark areas
+    let shadow_tint = vec3<f32>(0.03, 0.04, 0.08);
+    let shadow_mask = 1.0 - smoothstep(0.0, 0.3, lum);
+
+    // Highlight push — add subtle warmth to bright areas
+    let highlight_tint = vec3<f32>(0.05, 0.03, 0.0);
+    let highlight_mask = smoothstep(0.5, 0.9, lum);
+
+    var graded = color;
+    graded += shadow_tint * shadow_mask;
+    graded += highlight_tint * highlight_mask;
+
+    // Slight contrast increase (S-curve)
+    graded = clamp(graded, vec3<f32>(0.0), vec3<f32>(1.0));
+    graded = graded * graded * (3.0 - 2.0 * graded); // smoothstep-like S-curve
+    // Blend with original to keep it subtle
+    graded = mix(color, graded, 0.35);
+
+    return graded;
+}
+
 @fragment
 fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
     let scene = textureSample(src_texture, src_sampler, in.uv).rgb;
@@ -99,7 +124,15 @@ fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
     let combined = scene + bloom * BLOOM_INTENSITY;
 
     // ACES tone mapping (output is linear, sRGB surface handles gamma)
-    let mapped = aces_tonemap(combined);
+    var mapped = aces_tonemap(combined);
+
+    // Color grading — cinematic look
+    mapped = color_grade(mapped);
+
+    // Vignette — darken screen corners
+    let vignette_uv = (in.uv - 0.5) * 2.0;
+    let vignette = 1.0 - smoothstep(0.5, 1.5, length(vignette_uv));
+    mapped *= mix(0.7, 1.0, vignette); // subtle darkening at edges
 
     return vec4<f32>(mapped, 1.0);
 }

@@ -4,12 +4,81 @@
 
 struct Camera {
     view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
     eye_pos: vec3<f32>,
     time: f32,
 }
 
 @group(0) @binding(0)
 var<uniform> camera: Camera;
+
+// ════════════════════════════════════════════════════
+//  Scene Lights (global 3-light setup)
+// ════════════════════════════════════════════════════
+
+struct SceneLight {
+    direction: vec3<f32>,
+    _pad0: f32,
+    color: vec3<f32>,
+    intensity: f32,
+}
+
+struct SceneLights {
+    key: SceneLight,
+    fill: SceneLight,
+    rim: SceneLight,
+}
+
+@group(1) @binding(0)
+var<uniform> scene_lights: SceneLights;
+
+fn apply_scene_lights(n: vec3<f32>, view_dir: vec3<f32>, base_color: vec3<f32>, roughness: f32) -> vec3<f32> {
+    var result = vec3<f32>(0.0);
+
+    // Key light — diffuse + specular
+    let key_ndl = max(dot(n, scene_lights.key.direction), 0.0);
+    let key_h = normalize(scene_lights.key.direction + view_dir);
+    let key_spec = pow(max(dot(n, key_h), 0.0), mix(128.0, 32.0, roughness));
+    result += scene_lights.key.color * scene_lights.key.intensity * (base_color * key_ndl * 0.6 + key_spec * 0.3);
+
+    // Fill light — mostly diffuse, soft
+    let fill_ndl = max(dot(n, scene_lights.fill.direction), 0.0);
+    let fill_h = normalize(scene_lights.fill.direction + view_dir);
+    let fill_spec = pow(max(dot(n, fill_h), 0.0), mix(64.0, 16.0, roughness));
+    result += scene_lights.fill.color * scene_lights.fill.intensity * (base_color * fill_ndl * 0.4 + fill_spec * 0.1);
+
+    // Rim light — edge highlight
+    let rim_ndl = max(dot(n, scene_lights.rim.direction), 0.0);
+    let rim_factor = pow(1.0 - max(dot(n, view_dir), 0.0), 3.0);
+    result += scene_lights.rim.color * scene_lights.rim.intensity * rim_factor * rim_ndl * 0.5;
+
+    return result;
+}
+
+// ════════════════════════════════════════════════════
+//  SSAO approximation (hemisphere + contact shadow)
+// ════════════════════════════════════════════════════
+
+fn fake_ssao(n: vec3<f32>, world_pos: vec3<f32>, view_dir: vec3<f32>) -> f32 {
+    // Hemisphere AO: surfaces facing up get more ambient light
+    let hemisphere_ao = 0.5 + 0.5 * dot(n, vec3<f32>(0.0, 1.0, 0.0));
+    // View-dependent cavity darkening
+    let cavity = 0.6 + 0.4 * max(dot(n, view_dir), 0.0);
+    // Contact shadow: darken near bottom of objects (approximate ground contact)
+    let contact = smoothstep(-0.3, 0.3, world_pos.y);
+    return hemisphere_ao * cavity * mix(0.7, 1.0, contact);
+}
+
+// ════════════════════════════════════════════════════
+//  Atmospheric fog
+// ════════════════════════════════════════════════════
+
+fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>, eye_pos: vec3<f32>) -> vec3<f32> {
+    let dist = length(world_pos - eye_pos);
+    let fog_factor = exp(-dist * 0.08);
+    let fog_color = vec3<f32>(0.01, 0.012, 0.03); // match background
+    return mix(fog_color, color, fog_factor);
+}
 
 // ════════════════════════════════════════════════════
 //  Mesh Vertex + Instance
@@ -476,39 +545,52 @@ fn mat_water(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
     let h_c = wave_height(uv * 2.0, tt);
     let h_r = wave_height((uv + vec2<f32>(eps, 0.0)) * 2.0, tt);
     let h_u = wave_height((uv + vec2<f32>(0.0, eps)) * 2.0, tt);
-    let normal = normalize(vec3<f32>((h_c - h_r) / eps * 0.3, 1.0, (h_c - h_u) / eps * 0.3));
+    let normal = normalize(vec3<f32>((h_c - h_r) / eps * 0.5, 1.0, (h_c - h_u) / eps * 0.5));
 
     // Fresnel
     let view_dir = normalize(vec3<f32>(0.0, 1.0, 0.3));
     let n_dot_v = max(dot(normal, view_dir), 0.0);
     let fresnel = pow(1.0 - n_dot_v, 5.0) * 0.7 + 0.1;
 
-    // Deep ocean color
-    let deep = vec3<f32>(0.01, 0.04, 0.15);
-    let mid = vec3<f32>(0.02, 0.12, 0.35);
-    let shallow = vec3<f32>(0.05, 0.25, 0.5);
+    // Deep ocean color — richer
+    let deep = vec3<f32>(0.005, 0.03, 0.12);
+    let mid = vec3<f32>(0.02, 0.10, 0.30);
+    let shallow = vec3<f32>(0.06, 0.28, 0.55);
     let depth_t = 0.5 + h_c * 0.3;
     let base = mix(deep, mix(mid, shallow, depth_t), depth_t);
 
-    // Strong caustics
-    let c_uv = uv * 2.0 + normal.xz * 0.1;
-    let caustic = water_caustics(c_uv, tt) * 1.2;
-    let caustic_col = vec3<f32>(0.15, 0.5, 0.7) * caustic;
+    // Enhanced caustics
+    let c_uv = uv * 2.0 + normal.xz * 0.15;
+    let caustic = water_caustics(c_uv, tt) * 1.8;
+    let caustic_col = vec3<f32>(0.2, 0.6, 0.8) * caustic;
 
-    // Specular — sun reflection on water
+    // Specular — multiple highlight sources for more visible waves
     let light = normalize(vec3<f32>(0.2, 0.9, 0.3));
     let hv = normalize(light + view_dir);
-    let spec = pow(max(dot(normal, hv), 0.0), 128.0) * 0.8;
-    // Secondary scattered highlights
-    let spec2 = pow(max(dot(normal, hv), 0.0), 32.0) * 0.15;
+    let spec = pow(max(dot(normal, hv), 0.0), 128.0) * 1.2;
+    // Secondary scattered highlights — stronger
+    let spec2 = pow(max(dot(normal, hv), 0.0), 32.0) * 0.3;
+    // Third light for more wave definition
+    let light3 = normalize(vec3<f32>(-0.4, 0.7, 0.5));
+    let hv3 = normalize(light3 + view_dir);
+    let spec3 = pow(max(dot(normal, hv3), 0.0), 64.0) * 0.25;
 
     // Sky reflection
-    let sky = vec3<f32>(0.2, 0.35, 0.6);
-    var color = mix(base, sky, fresnel * 0.5) + caustic_col + vec3<f32>(spec + spec2);
+    let sky = vec3<f32>(0.15, 0.3, 0.55);
 
-    // Foam on wave crests
-    let foam = smoothstep(0.25, 0.45, h_c) * 0.2;
-    color = mix(color, vec3<f32>(0.8, 0.9, 0.95), foam);
+    // Environment reflection
+    let refl_dir = reflect(-view_dir, normal);
+    let env = env_reflect(refl_dir, t);
+
+    var color = mix(base, mix(sky, env, 0.3), fresnel * 0.6) + caustic_col + vec3<f32>(spec + spec2 + spec3);
+
+    // Foam on wave crests — more visible
+    let foam = smoothstep(0.2, 0.4, h_c) * 0.3;
+    color = mix(color, vec3<f32>(0.85, 0.92, 0.97), foam);
+
+    // Wave crest highlights — thin bright lines on wave peaks
+    let crest = smoothstep(0.0, 0.02, h_c - 0.3) * smoothstep(0.06, 0.02, h_c - 0.3);
+    color += vec3<f32>(0.5, 0.7, 0.9) * crest * 0.4;
 
     return vec4<f32>(color, edge * 0.95);
 }
@@ -517,108 +599,78 @@ fn mat_water(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
 //  5: Fire — 炎 (volumetric ray-march)
 // ════════════════════════════════════════════════════
 
-fn fire_density(p: vec3<f32>, t: f32) -> f32 {
-    // Domain warp for organic turbulence
-    let warp = vec3<f32>(
-        simplex3d(p * 2.0 + vec3<f32>(t * 0.3, 0.0, 5.2)),
-        simplex3d(p * 2.0 + vec3<f32>(0.0, t * 0.2, 9.1)),
-        simplex3d(p * 2.0 + vec3<f32>(3.7, t * 0.4, 0.0))
-    ) * 0.3;
-    let warped = p + warp;
+fn mat_fire(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
+    let tt = t * 1.0;
 
-    // Scroll upward — fire rises
-    let scroll = vec3<f32>(warped.x, warped.y - t * 2.5, warped.z);
+    // UV.x = around cylinder (0→1 wraps), UV.y = height (0=bottom, 1=top)
+    let height = 1.0 - uv.y; // 0=top, 1=bottom → flip
+    let angle = uv.x;
 
-    // Multi-scale noise
-    let n1 = simplex3d_fbm(scroll * 2.5, 5) * 0.6;
-    let n2 = simplex3d(scroll * 5.0 + vec3<f32>(5.2, 1.3, 3.7)) * 0.25;
-    let n3 = simplex3d(scroll * 10.0 + vec3<f32>(1.7, 9.2, 2.1)) * 0.1;
-    let n4 = simplex3d(scroll * 20.0) * 0.05; // high-freq detail
+    // Scrolling noise coordinates — fire rises upward
+    let scroll_y = height * 3.0 - tt * 2.0;
+    let p = vec2<f32>(angle * 4.0, scroll_y);
+
+    // Domain warping for organic turbulence
+    let warp_x = simplex2d(p * 1.5 + vec2<f32>(tt * 0.3, 3.7)) * 0.4;
+    let warp_y = simplex2d(p * 1.5 + vec2<f32>(7.1, tt * 0.2)) * 0.3;
+    let warped = p + vec2<f32>(warp_x, warp_y);
+
+    // Multi-octave noise for flame shape
+    let n1 = simplex2d(warped * 1.0) * 0.5;
+    let n2 = simplex2d(warped * 2.3 + vec2<f32>(5.2, 1.3)) * 0.25;
+    let n3 = simplex2d(warped * 5.0 + vec2<f32>(1.7, 9.2)) * 0.12;
+    let n4 = simplex2d(warped * 10.0) * 0.06;
     let noise = n1 + n2 + n3 + n4;
 
-    // 3D tapered shape — narrow at top, wide at base
-    let radial = length(vec2<f32>(p.x, p.z));
-    let width = max(0.0, 0.5 - p.y * 0.4); // narrows with height
-    let radial_falloff = smoothstep(width, width * 0.3, radial);
-    let height_falloff = smoothstep(1.2, 0.0, p.y) * smoothstep(-0.1, 0.1, p.y);
+    // Flame shape — tall and tapered
+    let shape = smoothstep(1.0, 0.0, height) // fade at top
+        * smoothstep(-0.05, 0.15, height);    // solid at bottom
 
-    let d = (noise * 0.5 + 0.5) * radial_falloff * height_falloff;
-    return max(d - 0.1, 0.0) * 3.0;
-}
+    // Density combines noise and shape
+    let density = (noise * 0.5 + 0.5) * shape;
+    let d = max(density - 0.15, 0.0) * 3.5;
 
-fn fire_color(d: f32, p: vec3<f32>, t: f32) -> vec3<f32> {
-    // 5-stop gradient: black → dark red → orange → yellow → white
-    let col_black = vec3<f32>(0.1, 0.0, 0.0);
-    let col_red = vec3<f32>(0.8, 0.1, 0.0);
-    let col_orange = vec3<f32>(1.0, 0.4, 0.0);
-    let col_yellow = vec3<f32>(1.0, 0.85, 0.2);
-    let col_white = vec3<f32>(1.0, 0.98, 0.9);
+    if d < 0.01 { discard; }
 
-    var c: vec3<f32>;
-    if d > 0.8 {
-        c = mix(col_yellow, col_white, (d - 0.8) / 0.2);
-    } else if d > 0.5 {
-        c = mix(col_orange, col_yellow, (d - 0.5) / 0.3);
-    } else if d > 0.2 {
-        c = mix(col_red, col_orange, (d - 0.2) / 0.3);
+    // 5-stop color gradient based on density + height
+    let temp = d * (1.0 - height * 0.5); // hotter at bottom
+    var fire_col: vec3<f32>;
+    if temp > 0.8 {
+        fire_col = mix(vec3<f32>(1.0, 0.85, 0.2), vec3<f32>(1.0, 0.98, 0.9), (temp - 0.8) / 0.4);
+    } else if temp > 0.5 {
+        fire_col = mix(vec3<f32>(1.0, 0.4, 0.0), vec3<f32>(1.0, 0.85, 0.2), (temp - 0.5) / 0.3);
+    } else if temp > 0.2 {
+        fire_col = mix(vec3<f32>(0.8, 0.1, 0.0), vec3<f32>(1.0, 0.4, 0.0), (temp - 0.2) / 0.3);
     } else {
-        c = mix(col_black, col_red, d / 0.2);
+        fire_col = mix(vec3<f32>(0.15, 0.0, 0.0), vec3<f32>(0.8, 0.1, 0.0), temp / 0.2);
     }
 
-    // Height-based tint: more blue at very top (hot gas)
-    let blue_tint = smoothstep(0.8, 1.2, p.y) * 0.2;
-    c = mix(c, vec3<f32>(0.3, 0.4, 0.8), blue_tint);
+    // HDR emission — bright core makes bloom pick it up
+    var emission = fire_col * d * 2.5;
 
-    return c;
-}
+    // Blue core at very bottom center
+    let blue_zone = smoothstep(0.3, 0.0, height) * smoothstep(0.3, 0.8, d);
+    emission = mix(emission, vec3<f32>(0.3, 0.5, 1.5) * d, blue_zone * 0.4);
 
-fn mat_fire(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
-    let tt = t * 1.2;
-
-    // Ray from camera through the volume
-    let view_dir = normalize(wp - ep);
-    let local_x = (uv.x - 0.5) * 2.0;
-    let local_y = 1.0 - uv.y;
-    let ray_origin = vec3<f32>(local_x, local_y, -0.6);
-    let ray_dir = normalize(vec3<f32>(view_dir.x * 0.4, view_dir.y * 0.15, 1.0));
-
-    var accum_color = vec3<f32>(0.0);
-    var accum_alpha = 0.0;
-    let steps = 32;
-    let step_size = 1.2 / f32(steps);
-
-    for (var i = 0; i < steps; i++) {
-        let pos = ray_origin + ray_dir * (f32(i) * step_size);
-        let d = fire_density(pos, tt);
-        if d > 0.001 {
-            let fc = fire_color(d, pos, tt);
-
-            // HDR emission — bright core for bloom
-            let emission = fc * d * step_size * 15.0;
-            accum_color += emission * (1.0 - accum_alpha);
-            accum_alpha += d * step_size * 5.0 * (1.0 - accum_alpha);
-        }
-        if accum_alpha >= 0.97 { break; }
-    }
-
-    // Ember particles — small bright dots
-    let ember_uv = uv * 8.0;
+    // Ember particles
+    let ember_uv = vec2<f32>(angle * 12.0, (1.0 - uv.y) * 8.0);
     let ember_cell = floor(ember_uv);
     let ember_hash = fract(sin(dot(ember_cell, vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let ember_y = fract(ember_hash * 3.0 - tt * (0.5 + ember_hash));
-    let ember_x = fract(ember_hash * 7.0) + sin(tt * 2.0 + ember_hash * 10.0) * 0.1;
+    let ember_speed = 0.5 + ember_hash * 1.5;
+    let ember_y = fract(ember_hash * 3.0 - tt * ember_speed);
+    let ember_x = fract(ember_hash * 7.0) + sin(tt * 2.0 + ember_hash * 10.0) * 0.15;
     let ember_dist = length(fract(ember_uv) - vec2<f32>(ember_x, ember_y));
-    let ember = smoothstep(0.05, 0.0, ember_dist) * step(0.7, ember_hash) * 0.5;
-    accum_color += vec3<f32>(1.0, 0.6, 0.1) * ember;
-    accum_alpha = max(accum_alpha, ember * 0.5);
+    let ember = smoothstep(0.04, 0.0, ember_dist) * step(0.65, ember_hash);
+    var final_emit = emission + vec3<f32>(1.0, 0.7, 0.2) * ember * 2.0;
 
-    // Multi-frequency flicker
-    let flicker = 0.85 + 0.15 * sin(tt * 15.0) * sin(tt * 9.3 + 1.7) * sin(tt * 23.0 + 3.1);
-    accum_color *= flicker;
+    // Flicker
+    let flicker = 0.88 + 0.12 * sin(tt * 15.0) * sin(tt * 9.3 + 1.7);
+    final_emit *= flicker;
 
-    let alpha = clamp(accum_alpha, 0.0, 1.0);
-    if alpha < 0.01 { return vec4<f32>(0.0); }
-    return vec4<f32>(accum_color, alpha);
+    // Alpha: opaque core, transparent edges
+    let alpha = clamp(d * 1.5, 0.0, 1.0);
+
+    return vec4<f32>(final_emit, alpha);
 }
 
 // ════════════════════════════════════════════════════
@@ -646,24 +698,26 @@ fn mat_smoke(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
     let tt = t * 0.5;
     let center = uv - 0.5;
     let dist = length(center);
-    let edge = 1.0 - smoothstep(0.4, 0.5, dist);
+    let edge = 1.0 - smoothstep(0.45, 0.5, dist);
     if edge <= 0.0 { return vec4<f32>(0.0); }
 
     // Map UV to 3D volume
     let ray_origin = vec3<f32>((uv.x - 0.5) * 2.0, 1.0 - uv.y, -0.5);
     let ray_dir = vec3<f32>(0.0, 0.0, 1.0);
-    let step_size = 1.0 / 14.0;
+    let steps = 24;
+    let step_size = 1.2 / f32(steps);
 
     var transmittance = 1.0;
     var accum_color = vec3<f32>(0.0);
-    let absorption = 3.5;
+    let absorption = 6.0; // increased density
 
-    // Light direction for simple scattering
+    // Light direction for scattering
     let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
-    let base_col = vec3<f32>(0.28, 0.30, 0.38);
-    let scatter_col = vec3<f32>(0.35, 0.38, 0.45);
+    let base_col = vec3<f32>(0.15, 0.16, 0.22); // darker smoke
+    let scatter_col = vec3<f32>(0.25, 0.28, 0.38);
+    let highlight_col = vec3<f32>(0.4, 0.42, 0.55); // lit edges
 
-    for (var i = 0; i < 14; i++) {
+    for (var i = 0; i < 24; i++) {
         let pos = ray_origin + ray_dir * (f32(i) * step_size);
         let d = smoke_density(pos, tt);
         if d > 0.001 {
@@ -671,19 +725,20 @@ fn mat_smoke(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
             let extinct = d * absorption * step_size;
             let tr_step = exp(-extinct);
 
-            // Simple forward scattering approximation
+            // Multi-sample light scattering
             let light_sample = smoke_density(pos + light_dir * 0.15, tt);
-            let light_atten = exp(-light_sample * 1.5);
-            let lit_color = mix(base_col, scatter_col, light_atten * 0.6);
+            let light_sample2 = smoke_density(pos + light_dir * 0.3, tt);
+            let light_atten = exp(-(light_sample + light_sample2 * 0.5) * 2.0);
+            let lit_color = mix(base_col, mix(scatter_col, highlight_col, light_atten), light_atten * 0.7);
 
-            // Accumulate with absorption
-            accum_color += lit_color * d * step_size * transmittance * 2.0;
+            // Accumulate with absorption — more contribution
+            accum_color += lit_color * d * step_size * transmittance * 3.5;
             transmittance *= tr_step;
         }
-        if transmittance < 0.05 { break; }
+        if transmittance < 0.03 { break; }
     }
 
-    let alpha = (1.0 - transmittance) * edge * 0.7;
+    let alpha = (1.0 - transmittance) * edge * 0.9;
     if alpha < 0.01 { return vec4<f32>(0.0); }
     return vec4<f32>(accum_color, clamp(alpha, 0.0, 1.0));
 }
@@ -712,35 +767,46 @@ fn mat_aurora(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> 
     let x = uv.x;
     let y = uv.y;
 
-    let vert_mask = smoothstep(0.0, 0.3, y) * smoothstep(1.0, 0.6, y);
+    let vert_mask = smoothstep(0.0, 0.15, y) * smoothstep(1.0, 0.7, y);
     if vert_mask <= 0.01 { return vec4<f32>(0.0); }
 
     var intensity = 0.0;
     var cmix = 0.0;
 
-    let b1c = 0.5 + aurora_band(x, tt, 3.0, 0.0, 1.0, 0.15);
+    // Band 1 — wider, more visible
+    let b1c = 0.5 + aurora_band(x, tt, 3.0, 0.0, 1.0, 0.18);
     let b1d = abs(y - b1c);
-    let b1w = 0.12 + aurora_n1d(x * 3.0 + tt * 0.4) * 0.06;
+    let b1w = 0.18 + aurora_n1d(x * 3.0 + tt * 0.4) * 0.10;
     let b1 = smoothstep(b1w, 0.0, b1d);
-    intensity += b1 * 0.6; cmix += b1 * 0.3;
+    intensity += b1 * 0.8; cmix += b1 * 0.3;
 
-    let b2c = 0.45 + aurora_band(x, tt, 4.5, 2.1, 0.7, 0.12);
+    // Band 2 — wider
+    let b2c = 0.45 + aurora_band(x, tt, 4.5, 2.1, 0.7, 0.15);
     let b2d = abs(y - b2c);
-    let b2w = 0.08 + aurora_n1d(x * 4.0 + tt * 0.6 + 3.0) * 0.05;
+    let b2w = 0.14 + aurora_n1d(x * 4.0 + tt * 0.6 + 3.0) * 0.08;
     let b2 = smoothstep(b2w, 0.0, b2d);
-    intensity += b2 * 0.4; cmix += b2 * 0.7;
+    intensity += b2 * 0.6; cmix += b2 * 0.7;
 
-    let b3c = 0.55 + aurora_band(x, tt, 6.0, 4.5, 1.3, 0.09);
+    // Band 3
+    let b3c = 0.55 + aurora_band(x, tt, 6.0, 4.5, 1.3, 0.12);
     let b3d = abs(y - b3c);
-    let b3w = 0.03 + aurora_n1d(x * 5.0 + tt * 0.8 + 7.0) * 0.02;
+    let b3w = 0.08 + aurora_n1d(x * 5.0 + tt * 0.8 + 7.0) * 0.05;
     let b3 = smoothstep(b3w, 0.0, b3d);
-    intensity += b3 * 0.8; cmix += b3 * 0.5;
+    intensity += b3 * 0.9; cmix += b3 * 0.5;
 
-    let b4c = 0.48 + aurora_band(x, tt, 2.0, 1.3, 0.5, 0.18);
+    // Band 4 — wide ambient glow
+    let b4c = 0.48 + aurora_band(x, tt, 2.0, 1.3, 0.5, 0.20);
     let b4d = abs(y - b4c);
-    let b4w = 0.2 + aurora_n1d(x * 2.0 + tt * 0.2 + 5.0) * 0.1;
+    let b4w = 0.25 + aurora_n1d(x * 2.0 + tt * 0.2 + 5.0) * 0.12;
     let b4 = smoothstep(b4w, 0.0, b4d);
-    intensity += b4 * 0.2; cmix += b4 * 0.9;
+    intensity += b4 * 0.4; cmix += b4 * 0.9;
+
+    // Band 5 — additional wide curtain
+    let b5c = 0.42 + aurora_band(x, tt, 2.5, 3.7, 0.8, 0.16);
+    let b5d = abs(y - b5c);
+    let b5w = 0.20 + aurora_n1d(x * 2.5 + tt * 0.3 + 9.0) * 0.08;
+    let b5 = smoothstep(b5w, 0.0, b5d);
+    intensity += b5 * 0.3; cmix += b5 * 0.6;
 
     if intensity <= 0.01 { return vec4<f32>(0.0); }
 
@@ -750,16 +816,19 @@ fn mat_aurora(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> 
     let ray = 0.7 + 0.3 * sin(x * 40.0 + tt * 0.3) * sin(x * 17.0 - tt * 0.7);
     intensity *= ray;
 
-    let col1 = vec3<f32>(0.1, 0.8, 0.4);
-    let col2 = vec3<f32>(0.3, 0.2, 0.9);
+    let col1 = vec3<f32>(0.1, 0.9, 0.45);
+    let col2 = vec3<f32>(0.35, 0.2, 1.0);
+    let col3 = vec3<f32>(0.8, 0.2, 0.5); // pink/magenta accent
     let pos_shift = sin(x * 5.0 + tt * 0.3) * 0.3 + 0.5;
     let final_t = mix(cmix, pos_shift, 0.4);
     var aurora_col = mix(col1, col2, final_t);
-    aurora_col += vec3<f32>(pow(intensity, 0.5) * 0.3);
-    aurora_col *= 1.5;
+    // Add pink accent at high intensity
+    aurora_col = mix(aurora_col, col3, smoothstep(0.6, 1.0, intensity) * 0.25);
+    aurora_col += vec3<f32>(pow(intensity, 0.5) * 0.35);
+    aurora_col *= 2.0; // brighter overall
 
-    let glow = pow(intensity, 0.7);
-    let h_fade = smoothstep(0.0, 0.1, x) * smoothstep(1.0, 0.9, x);
+    let glow = pow(intensity, 0.6);
+    let h_fade = smoothstep(0.0, 0.05, x) * smoothstep(1.0, 0.95, x);
     let alpha = clamp(glow * vert_mask * h_fade, 0.0, 1.0);
     return vec4<f32>(aurora_col * glow, alpha);
 }
@@ -1292,24 +1361,24 @@ fn mat_bubble_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3<
     let range_b = max(max(irid_b.x, irid_b.y), irid_b.z) - min(min(irid_b.x, irid_b.y), irid_b.z);
     let mask_b = smoothstep(0.7, 0.95, range_b) * (0.003 + fresnel * 0.012);
 
-    // Specular
-    let light = normalize(vec3<f32>(0.3, 1.0, 0.6));
-    let h = normalize(light + view_dir);
-    let spec_f = pow(max(dot(n, h), 0.0), 256.0) * 0.7;
-    let spec_b = pow(max(dot(-n, h), 0.0), 128.0) * 0.1;
+    // Scene lights specular
+    let key_h = normalize(scene_lights.key.direction + view_dir);
+    let spec_key = pow(max(dot(n, key_h), 0.0), 256.0) * 0.7 * scene_lights.key.intensity;
+    let spec_b_val = pow(max(dot(-n, key_h), 0.0), 128.0) * 0.1;
+    let fill_h = normalize(scene_lights.fill.direction + view_dir);
+    let spec_fill = pow(max(dot(n, fill_h), 0.0), 180.0) * 0.3 * scene_lights.fill.intensity;
 
     let sheen = fresnel * vec3<f32>(0.2, 0.25, 0.35) * 0.08;
-    let light2 = normalize(vec3<f32>(-0.6, 0.5, 0.3));
-    let h2 = normalize(light2 + view_dir);
-    let spec2 = pow(max(dot(n, h2), 0.0), 180.0) * 0.3;
 
     let bands = irid_f * mask_f + irid_b * mask_b;
     let band_lum = max(bands.x, max(bands.y, bands.z));
     let shell_alpha = 0.025;
     let shell_color = vec3<f32>(0.15, 0.18, 0.25) * shell_alpha;
 
-    let emit = shell_color + sheen + bands + vec3<f32>(spec_f + spec_b + spec2);
-    let a = shell_alpha + band_lum + spec_f + spec_b + spec2;
+    let total_spec = spec_key + spec_b_val + spec_fill;
+    let ao = fake_ssao(n, wp, view_dir);
+    let emit = (shell_color + sheen + bands) * ao + vec3<f32>(total_spec);
+    let a = shell_alpha + band_lum + total_spec;
     return vec4<f32>(emit, a);
 }
 
@@ -1323,28 +1392,31 @@ fn mat_glass_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3<f
     let pattern = sin(refracted_uv.x * 20.0 + t * 0.5) * sin(refracted_uv.y * 15.0 + t * 0.3) * 0.5 + 0.5;
     let caustic = pow(max(pattern, 0.0), 3.0) * 0.3;
 
-    let light = normalize(vec3<f32>(0.3, 0.8, 0.5));
-    let h = normalize(light + view_dir);
-    let spec = pow(max(dot(n, h), 0.0), 512.0) * 1.2;
-    let spec2 = pow(max(dot(n, h), 0.0), 64.0) * 0.2;
+    // Scene lights specular
+    let key_h = normalize(scene_lights.key.direction + view_dir);
+    let spec = pow(max(dot(n, key_h), 0.0), 512.0) * 1.2 * scene_lights.key.intensity;
+    let spec2 = pow(max(dot(n, key_h), 0.0), 64.0) * 0.2;
 
     let base_color = vec3<f32>(0.12, 0.16, 0.25);
-    let reflect_color = vec3<f32>(0.3, 0.4, 0.6);
 
     let refl_dir = reflect(-view_dir, n);
     let env = env_reflect(refl_dir, t);
 
-    var color = mix(base_color * (0.3 + caustic), env * 0.6, fresnel);
+    let ao = fake_ssao(n, wp, view_dir);
+    var color = mix(base_color * (0.3 + caustic), env * 0.6, fresnel) * ao;
     color += vec3<f32>(spec + spec2);
 
-    // Rim light
+    // Scene rim light
     let rim = pow(1.0 - n_dot_v, 6.0);
-    color += vec3<f32>(0.4, 0.5, 0.7) * rim * 0.2;
+    color += scene_lights.rim.color * rim * scene_lights.rim.intensity * 0.3;
 
     // Streak
     let streak_pos = fract(t * 0.08) * 3.0 - 1.0;
     let streak = exp(-pow(uv.x * 0.5 + uv.y * 0.5 - streak_pos, 2.0) * 400.0) * 0.3;
     color += vec3<f32>(streak);
+
+    // Add scene lights contribution
+    color += apply_scene_lights(n, view_dir, base_color, 0.1) * 0.3;
 
     let alpha = 0.2 + fresnel * 0.5 + spec * 0.3;
     return vec4<f32>(color, clamp(alpha, 0.0, 1.0));
@@ -1364,16 +1436,16 @@ fn mat_metal_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3<f
     );
     let scratch = vnoise(vec2<f32>(scratch_uv.x * 2.0, scratch_uv.y * 40.0)) * 0.08;
 
-    // 3-light setup using mesh normal
+    // Use scene lights instead of hardcoded lights
     let lights = array<vec3<f32>, 3>(
-        normalize(vec3<f32>(0.5, 0.8, 0.6)),
-        normalize(vec3<f32>(-0.7, 0.3, 0.5)),
-        normalize(vec3<f32>(0.0, -0.5, 0.8))
+        scene_lights.key.direction,
+        scene_lights.fill.direction,
+        scene_lights.rim.direction
     );
     let lcols = array<vec3<f32>, 3>(
-        vec3<f32>(1.0, 0.95, 0.9),
-        vec3<f32>(0.7, 0.8, 1.0),
-        vec3<f32>(0.9, 0.85, 0.8)
+        scene_lights.key.color * scene_lights.key.intensity,
+        scene_lights.fill.color * scene_lights.fill.intensity,
+        scene_lights.rim.color * scene_lights.rim.intensity
     );
 
     var total_spec = vec3<f32>(0.0);
@@ -1394,8 +1466,9 @@ fn mat_metal_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3<f
     let refl_dir = reflect(-view_dir, n);
     let env = env_reflect(refl_dir, t) * 1.5;
 
+    let ao = fake_ssao(n, wp, view_dir);
     let ambient = base_col * 0.12;
-    var color = ambient + base_col * total_diff + total_spec * base_col + env * base_col * 0.5;
+    var color = (ambient + base_col * total_diff + total_spec * base_col + env * base_col * 0.5) * ao;
     color += vec3<f32>(scratch) * base_col;
     color *= (0.7 + 0.3 * smoothstep(0.0, 0.3, n_dot_v));
 
@@ -1414,13 +1487,11 @@ fn mat_crystal_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3
     // Internal glow
     let internal = vec3<f32>(0.6, 0.4, 0.8) * (0.2 + 0.1 * sin(t * 1.5 + uv.x * 5.0));
 
-    // Specular sparkles
-    let light = normalize(vec3<f32>(0.5, 0.8, 0.3));
-    let h = normalize(light + view_dir);
-    let spec1 = pow(max(dot(perturbed_n, h), 0.0), 256.0) * 1.5;
-    let light2 = normalize(vec3<f32>(-0.3, 0.5, -0.7));
-    let h2 = normalize(light2 + view_dir);
-    let spec2 = pow(max(dot(perturbed_n, h2), 0.0), 128.0) * 0.6;
+    // Scene lights specular sparkles
+    let key_h = normalize(scene_lights.key.direction + view_dir);
+    let spec1 = pow(max(dot(perturbed_n, key_h), 0.0), 256.0) * 1.5 * scene_lights.key.intensity;
+    let fill_h = normalize(scene_lights.fill.direction + view_dir);
+    let spec2 = pow(max(dot(perturbed_n, fill_h), 0.0), 128.0) * 0.6 * scene_lights.fill.intensity;
 
     // Rainbow dispersion at edges
     let dispersion = fresnel * vec3<f32>(
@@ -1433,8 +1504,11 @@ fn mat_crystal_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3
     let refl_dir = reflect(-view_dir, perturbed_n);
     let env = env_reflect(refl_dir, t);
 
-    var color = internal * (1.0 - fresnel) + env * fresnel + dispersion;
+    let ao = fake_ssao(n, wp, view_dir);
+    var color = (internal * (1.0 - fresnel) + env * fresnel + dispersion) * ao;
     color += vec3<f32>(spec1 + spec2);
+    // Add scene lights contribution
+    color += apply_scene_lights(n, view_dir, vec3<f32>(0.4, 0.6, 0.9), 0.2) * 0.2;
 
     return vec4<f32>(color, 0.8 + fresnel * 0.2);
 }
@@ -1473,7 +1547,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if col.a < 0.001 {
         discard;
     }
-    return col;
+
+    // Atmospheric fog — fade distant objects toward background
+    let fogged = apply_fog(col.rgb, wp, ep);
+    return vec4<f32>(fogged, col.a);
 }
 
 // ════════════════════════════════════════════════════
@@ -1503,23 +1580,155 @@ fn vs_bg(@builtin(vertex_index) vi: u32) -> BgOutput {
     return out;
 }
 
+// Floor grid pattern
+fn floor_grid(pos: vec2<f32>) -> f32 {
+    let grid_size = 2.0;
+    let line_width = 0.02;
+    let gx = abs(fract(pos.x / grid_size + 0.5) - 0.5) * grid_size;
+    let gy = abs(fract(pos.y / grid_size + 0.5) - 0.5) * grid_size;
+    let line = min(gx, gy);
+    return smoothstep(line_width, 0.0, line);
+}
+
+// Sky gradient color (shared between sky and floor reflection)
+fn sky_gradient(y: f32, t: f32) -> vec3<f32> {
+    let col_bottom = vec3<f32>(0.005, 0.005, 0.015);
+    let col_mid = vec3<f32>(0.015, 0.02, 0.05);
+    let col_top = vec3<f32>(0.03, 0.04, 0.10);
+    // Two-stage gradient for richer sky
+    if y < 0.5 {
+        return mix(col_bottom, col_mid, y * 2.0);
+    }
+    return mix(col_mid, col_top, (y - 0.5) * 2.0);
+}
+
+// Procedural star field using noise
+fn star_field(uv: vec2<f32>, t: f32) -> f32 {
+    // Multiple layers of stars at different scales
+    var stars = 0.0;
+
+    // Large bright stars
+    let s1 = hash21(floor(uv * 80.0));
+    let s1_pos = fract(uv * 80.0);
+    let s1_dist = length(s1_pos - 0.5);
+    let s1_bright = step(0.97, s1) * smoothstep(0.08, 0.0, s1_dist);
+    let s1_twinkle = 0.7 + 0.3 * sin(t * 2.0 + s1 * 100.0);
+    stars += s1_bright * s1_twinkle * 0.8;
+
+    // Medium stars
+    let s2 = hash21(floor(uv * 200.0));
+    let s2_pos = fract(uv * 200.0);
+    let s2_dist = length(s2_pos - 0.5);
+    let s2_bright = step(0.95, s2) * smoothstep(0.06, 0.0, s2_dist);
+    let s2_twinkle = 0.8 + 0.2 * sin(t * 3.1 + s2 * 77.0);
+    stars += s2_bright * s2_twinkle * 0.4;
+
+    // Tiny faint stars
+    let s3 = hash21(floor(uv * 500.0));
+    let s3_pos = fract(uv * 500.0);
+    let s3_dist = length(s3_pos - 0.5);
+    stars += step(0.93, s3) * smoothstep(0.04, 0.0, s3_dist) * 0.15;
+
+    return stars;
+}
+
+// Procedural nebula / cloud wisps using FBM
+fn nebula_wisps(uv: vec2<f32>, t: f32) -> vec3<f32> {
+    let p = uv * 3.0 + vec2<f32>(t * 0.01, t * 0.005);
+
+    // FBM nebula layer 1 — purple/blue
+    let n1 = simplex_fbm(p + vec2<f32>(0.0, 0.0), 5) * 0.5 + 0.5;
+    let nebula1 = vec3<f32>(0.15, 0.05, 0.25) * pow(n1, 3.0) * 0.4;
+
+    // FBM nebula layer 2 — teal/cyan
+    let n2 = simplex_fbm(p * 1.3 + vec2<f32>(5.2, 3.1), 4) * 0.5 + 0.5;
+    let nebula2 = vec3<f32>(0.03, 0.1, 0.15) * pow(n2, 3.5) * 0.3;
+
+    // Subtle warm wisp
+    let n3 = simplex_fbm(p * 0.7 + vec2<f32>(8.7, 1.4), 3) * 0.5 + 0.5;
+    let nebula3 = vec3<f32>(0.08, 0.03, 0.02) * pow(n3, 4.0) * 0.2;
+
+    return nebula1 + nebula2 + nebula3;
+}
+
 @fragment
 fn fs_bg(in: BgOutput) -> @location(0) vec4<f32> {
     let t = camera.time;
     let y = in.uv.y;
 
-    // Dark gradient from bottom to top
-    let col_bottom = vec3<f32>(0.01, 0.01, 0.03);
-    let col_top = vec3<f32>(0.03, 0.04, 0.08);
-    var color = mix(col_bottom, col_top, y);
+    // Rich night sky gradient
+    var color = sky_gradient(y, t);
 
-    // Subtle animated noise
+    // Procedural star field
+    let stars = star_field(in.uv, t);
+    // Stars are brighter in upper sky, fade near horizon
+    let star_mask = smoothstep(0.1, 0.5, y);
+    color += vec3<f32>(0.9, 0.92, 1.0) * stars * star_mask;
+
+    // Nebula / cloud wisps
+    color += nebula_wisps(in.uv, t) * smoothstep(0.15, 0.6, y);
+
+    // Horizon glow — subtle warm color near horizon line
+    let horizon_glow = exp(-pow((y - 0.15) * 8.0, 2.0)) * 0.08;
+    color += vec3<f32>(0.12, 0.06, 0.03) * horizon_glow;
+
+    // Very subtle animated noise for film grain feel
     let n = vnoise(in.uv * 50.0 + vec2<f32>(t * 0.05, t * 0.03));
-    color += vec3<f32>(n * 0.008);
+    color += vec3<f32>(n * 0.005);
 
-    // Subtle vignette
-    let vig = 1.0 - length(in.uv - 0.5) * 0.8;
+    // Subtle vignette (moved main vignette to bloom composite, keep light one here)
+    let vig = 1.0 - length(in.uv - 0.5) * 0.4;
     color *= vig;
+
+    // ── Reflective floor via ray-plane intersection ──
+    let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
+    let near_h = camera.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let far_h = camera.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let ray_origin = near_h.xyz / near_h.w;
+    let ray_dir = normalize(far_h.xyz / far_h.w - ray_origin);
+
+    let floor_y = -2.5;
+    if ray_dir.y < -0.001 {
+        let t_hit = (floor_y - ray_origin.y) / ray_dir.y;
+        if t_hit > 0.0 {
+            let hit = ray_origin + ray_dir * t_hit;
+
+            // Base floor color — almost-black polished surface
+            let base_color = vec3<f32>(0.02, 0.02, 0.03);
+
+            // Grid lines
+            let grid = floor_grid(hit.xz);
+            let grid_color = vec3<f32>(0.06, 0.07, 0.12) * grid * 0.4;
+
+            // Fresnel — more reflective at grazing angles
+            let fresnel = pow(1.0 - abs(ray_dir.y), 4.0);
+
+            // Fake reflection: sample the sky gradient using the reflected ray direction
+            let refl_dir = reflect(ray_dir, vec3<f32>(0.0, 1.0, 0.0));
+            let refl_y = refl_dir.y * 0.5 + 0.5;
+            let refl_sky = sky_gradient(refl_y, t);
+            // Add some of the env_reflect for extra interest
+            let refl_env = env_reflect(refl_dir, t);
+            let reflection = mix(refl_sky, refl_env, 0.5) * fresnel * 0.6;
+
+            // Distance fade — floor fades to background at edges
+            let dist_fade = exp(-length(hit.xz) * 0.03);
+
+            // Fog — blend to background color at far distances
+            let fog_factor = exp(-t_hit * 0.015);
+
+            // Compose floor color
+            var floor_col = base_color + grid_color + reflection;
+
+            // Subtle noise on floor surface
+            let floor_noise = vnoise(hit.xz * 2.0 + vec2<f32>(t * 0.02, t * 0.01));
+            floor_col += vec3<f32>(floor_noise * 0.005);
+
+            // Apply distance fade and fog
+            floor_col *= dist_fade;
+            color = mix(color, floor_col, fog_factor);
+        }
+    }
 
     return vec4<f32>(color, 1.0);
 }

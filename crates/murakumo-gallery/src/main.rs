@@ -97,8 +97,56 @@ impl QuadInstance {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
     eye_pos: [f32; 3],
     time: f32,
+}
+
+// ── Scene Lights Uniform ──
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SceneLightData {
+    direction: [f32; 3],
+    _pad0: f32,
+    color: [f32; 3],
+    intensity: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SceneLightsUniform {
+    key: SceneLightData,
+    fill: SceneLightData,
+    rim: SceneLightData,
+}
+
+impl SceneLightsUniform {
+    fn default_lights() -> Self {
+        Self {
+            // Key light: warm white, from top-right-front
+            key: SceneLightData {
+                direction: Vec3::new(0.5, 0.8, 0.6).normalize().to_array(),
+                _pad0: 0.0,
+                color: [1.0, 0.95, 0.88],
+                intensity: 1.2,
+            },
+            // Fill light: cool blue, from left
+            fill: SceneLightData {
+                direction: Vec3::new(-0.7, 0.3, 0.4).normalize().to_array(),
+                _pad0: 0.0,
+                color: [0.6, 0.7, 1.0],
+                intensity: 0.5,
+            },
+            // Rim light: subtle, from behind
+            rim: SceneLightData {
+                direction: Vec3::new(0.0, 0.3, -0.9).normalize().to_array(),
+                _pad0: 0.0,
+                color: [0.8, 0.85, 1.0],
+                intensity: 0.4,
+            },
+        }
+    }
 }
 
 // ── Orbit Camera ──
@@ -635,6 +683,8 @@ struct GalleryApp {
     bg_pipeline: Option<wgpu::RenderPipeline>,
     camera_buffer: Option<wgpu::Buffer>,
     camera_bind_group: Option<wgpu::BindGroup>,
+    lights_buffer: Option<wgpu::Buffer>,
+    lights_bind_group: Option<wgpu::BindGroup>,
     instance_buffer: Option<wgpu::Buffer>,
     mesh_groups: Vec<MeshGroup>,
     // Post-processing
@@ -655,6 +705,8 @@ impl GalleryApp {
             bg_pipeline: None,
             camera_buffer: None,
             camera_bind_group: None,
+            lights_buffer: None,
+            lights_bind_group: None,
             instance_buffer: None,
             mesh_groups: Vec::new(),
             bloom: None,
@@ -850,6 +902,7 @@ impl SceneApp for GalleryApp {
         // Camera uniform
         let cam_data = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             eye_pos: [0.0; 3],
             time: 0.0,
         };
@@ -882,6 +935,37 @@ impl SceneApp for GalleryApp {
             }],
         });
 
+        // Scene lights uniform
+        let lights_data = SceneLightsUniform::default_lights();
+        let lights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gallery_lights_uniform"),
+            contents: bytemuck::bytes_of(&lights_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let lights_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gallery_lights_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let lights_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gallery_lights_bg"),
+            layout: &lights_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lights_buffer.as_entire_binding(),
+            }],
+        });
+
         // Shader
         let shader_src = include_str!("../shaders/gallery.wgsl");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -891,7 +975,7 @@ impl SceneApp for GalleryApp {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gallery_pipeline_layout"),
-            bind_group_layouts: &[&camera_bgl],
+            bind_group_layouts: &[&camera_bgl, &lights_bgl],
             push_constant_ranges: &[],
         });
 
@@ -1096,6 +1180,8 @@ impl SceneApp for GalleryApp {
         self.bg_pipeline = Some(hdr_bg_pipeline);
         self.camera_buffer = Some(camera_buffer);
         self.camera_bind_group = Some(camera_bg);
+        self.lights_buffer = Some(lights_buffer);
+        self.lights_bind_group = Some(lights_bg);
         self.instance_buffer = Some(instance_buffer);
         self.mesh_groups = mesh_groups;
         self.bloom = Some(bloom);
@@ -1112,13 +1198,16 @@ impl SceneApp for GalleryApp {
         let Some(ref bg_pipeline) = self.bg_pipeline else { return };
         let Some(ref camera_buffer) = self.camera_buffer else { return };
         let Some(ref camera_bg) = self.camera_bind_group else { return };
+        let Some(ref lights_bg) = self.lights_bind_group else { return };
         let Some(ref instance_buffer) = self.instance_buffer else { return };
 
         // Update camera uniform
         let vp = self.camera.view_proj();
+        let inv_vp = vp.inverse();
         let cam_pos = self.camera.position();
         let cam_uniform = CameraUniform {
             view_proj: vp.to_cols_array_2d(),
+            inv_view_proj: inv_vp.to_cols_array_2d(),
             eye_pos: cam_pos.to_array(),
             time: self.time,
         };
@@ -1157,10 +1246,12 @@ impl SceneApp for GalleryApp {
 
                 pass.set_pipeline(bg_pipeline);
                 pass.set_bind_group(0, camera_bg, &[]);
+                pass.set_bind_group(1, lights_bg, &[]);
                 pass.draw(0..6, 0..1);
 
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, camera_bg, &[]);
+                pass.set_bind_group(1, lights_bg, &[]);
                 for group in &self.mesh_groups {
                     pass.set_vertex_buffer(0, group.vertex_buffer.slice(..));
                     pass.set_vertex_buffer(1, instance_buffer.slice(..));
@@ -1202,10 +1293,12 @@ impl SceneApp for GalleryApp {
 
                 pass.set_pipeline(bg_pipeline);
                 pass.set_bind_group(0, camera_bg, &[]);
+                pass.set_bind_group(1, lights_bg, &[]);
                 pass.draw(0..6, 0..1);
 
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, camera_bg, &[]);
+                pass.set_bind_group(1, lights_bg, &[]);
                 for group in &self.mesh_groups {
                     pass.set_vertex_buffer(0, group.vertex_buffer.slice(..));
                     pass.set_vertex_buffer(1, instance_buffer.slice(..));
