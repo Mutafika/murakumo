@@ -565,7 +565,7 @@ impl BloomResources {
         // 2. Gaussian blur: 2 iterations (H then V each iteration)
         // Iteration 1: bright -> ping (H), ping -> pong (V)
         // Iteration 2: pong -> ping (H), ping -> pong (V)
-        for iter in 0..2u32 {
+        for iter in 0..3u32 {
             let src_h = if iter == 0 { &self.bright_view } else { &self.blur_pong_view };
             // Horizontal blur -> ping
             {
@@ -697,8 +697,8 @@ impl GalleryApp {
                 14 => (Vec3::splat(1.0), 0.2, 0.0),       // Dissolve
 
                 // Cylinder (raw r=0.5, h=1.0) → scale to match
-                5 => (Vec3::new(1.0, 1.5, 1.0), 0.05, 0.0),  // Fire (taller)
-                6 => (Vec3::new(1.1, 1.3, 1.1), 0.03, 0.0),  // Smoke
+                5 => (Vec3::new(1.5, 2.2, 1.5), 0.05, 0.0),  // Fire (big + tall)
+                6 => (Vec3::new(1.4, 1.8, 1.4), 0.03, 0.0),  // Smoke (big)
 
                 // Plane (raw 1x1) → scale up
                 7 => (Vec3::new(1.3, 1.0, 1.3), 0.08, 0.3),  // Aurora

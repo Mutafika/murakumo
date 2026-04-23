@@ -25,8 +25,8 @@ fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> VertexOutput {
 
 // ── Brightness extract ──
 
-const BLOOM_THRESHOLD: f32 = 0.7;
-const BLOOM_KNEE: f32 = 0.3;
+const BLOOM_THRESHOLD: f32 = 0.85;
+const BLOOM_KNEE: f32 = 0.15;
 
 fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -88,7 +88,7 @@ fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-const BLOOM_INTENSITY: f32 = 0.35;
+const BLOOM_INTENSITY: f32 = 0.25;
 
 @fragment
 fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -98,11 +98,8 @@ fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
     // Additive bloom with controlled intensity
     let combined = scene + bloom * BLOOM_INTENSITY;
 
-    // ACES tone mapping
+    // ACES tone mapping (output is linear, sRGB surface handles gamma)
     let mapped = aces_tonemap(combined);
 
-    // Gamma correction (linear -> sRGB)
-    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
-
-    return vec4<f32>(gamma, 1.0);
+    return vec4<f32>(mapped, 1.0);
 }

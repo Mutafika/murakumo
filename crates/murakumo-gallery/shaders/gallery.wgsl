@@ -518,65 +518,102 @@ fn mat_water(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
 // ════════════════════════════════════════════════════
 
 fn fire_density(p: vec3<f32>, t: f32) -> f32 {
-    // Scroll noise upward for rising flame effect
-    let scroll = vec3<f32>(p.x, p.y - t * 1.8, p.z);
-    // Multi-octave 3D simplex noise
-    let n1 = simplex3d_fbm(scroll * 3.0, 4);
-    let n2 = simplex3d(scroll * 6.0 + vec3<f32>(5.2, 1.3, 3.7)) * 0.3;
-    let n3 = simplex3d(scroll * 12.0 + vec3<f32>(1.7, 9.2, 2.1)) * 0.15;
-    let noise = n1 + n2 + n3;
+    // Domain warp for organic turbulence
+    let warp = vec3<f32>(
+        simplex3d(p * 2.0 + vec3<f32>(t * 0.3, 0.0, 5.2)),
+        simplex3d(p * 2.0 + vec3<f32>(0.0, t * 0.2, 9.1)),
+        simplex3d(p * 2.0 + vec3<f32>(3.7, t * 0.4, 0.0))
+    ) * 0.3;
+    let warped = p + warp;
 
-    // Tapered shape: density decreases with height and distance from center
-    let taper = max(0.0, 1.0 - p.y) * max(0.0, 1.0 - abs(p.x) * (1.0 + p.y * 2.0));
-    let d = (noise * 0.5 + 0.5) * taper;
-    return max(d - 0.15, 0.0) * 2.5;
+    // Scroll upward — fire rises
+    let scroll = vec3<f32>(warped.x, warped.y - t * 2.5, warped.z);
+
+    // Multi-scale noise
+    let n1 = simplex3d_fbm(scroll * 2.5, 5) * 0.6;
+    let n2 = simplex3d(scroll * 5.0 + vec3<f32>(5.2, 1.3, 3.7)) * 0.25;
+    let n3 = simplex3d(scroll * 10.0 + vec3<f32>(1.7, 9.2, 2.1)) * 0.1;
+    let n4 = simplex3d(scroll * 20.0) * 0.05; // high-freq detail
+    let noise = n1 + n2 + n3 + n4;
+
+    // 3D tapered shape — narrow at top, wide at base
+    let radial = length(vec2<f32>(p.x, p.z));
+    let width = max(0.0, 0.5 - p.y * 0.4); // narrows with height
+    let radial_falloff = smoothstep(width, width * 0.3, radial);
+    let height_falloff = smoothstep(1.2, 0.0, p.y) * smoothstep(-0.1, 0.1, p.y);
+
+    let d = (noise * 0.5 + 0.5) * radial_falloff * height_falloff;
+    return max(d - 0.1, 0.0) * 3.0;
+}
+
+fn fire_color(d: f32, p: vec3<f32>, t: f32) -> vec3<f32> {
+    // 5-stop gradient: black → dark red → orange → yellow → white
+    let col_black = vec3<f32>(0.1, 0.0, 0.0);
+    let col_red = vec3<f32>(0.8, 0.1, 0.0);
+    let col_orange = vec3<f32>(1.0, 0.4, 0.0);
+    let col_yellow = vec3<f32>(1.0, 0.85, 0.2);
+    let col_white = vec3<f32>(1.0, 0.98, 0.9);
+
+    var c: vec3<f32>;
+    if d > 0.8 {
+        c = mix(col_yellow, col_white, (d - 0.8) / 0.2);
+    } else if d > 0.5 {
+        c = mix(col_orange, col_yellow, (d - 0.5) / 0.3);
+    } else if d > 0.2 {
+        c = mix(col_red, col_orange, (d - 0.2) / 0.3);
+    } else {
+        c = mix(col_black, col_red, d / 0.2);
+    }
+
+    // Height-based tint: more blue at very top (hot gas)
+    let blue_tint = smoothstep(0.8, 1.2, p.y) * 0.2;
+    c = mix(c, vec3<f32>(0.3, 0.4, 0.8), blue_tint);
+
+    return c;
 }
 
 fn mat_fire(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
-    let tt = t * 1.5;
-    // Quick shape test
-    let center_x = abs(uv.x - 0.5) * 2.0;
-    let taper = mix(0.9, 0.2, uv.y);
-    let shape = 1.0 - smoothstep(taper * 0.6, taper, center_x);
-    let vert_fade = 1.0 - pow(uv.y, 1.5);
-    if shape * vert_fade <= 0.01 { return vec4<f32>(0.0); }
+    let tt = t * 1.2;
 
-    // Ray from camera through volume — gives parallax/3D feel
+    // Ray from camera through the volume
     let view_dir = normalize(wp - ep);
     let local_x = (uv.x - 0.5) * 2.0;
     let local_y = 1.0 - uv.y;
-    let ray_origin = vec3<f32>(local_x, local_y, -0.5);
-    // March along view direction projected into local volume space
-    let ray_dir = normalize(vec3<f32>(view_dir.x * 0.3, view_dir.y * 0.1, 1.0));
-    let step_size = 1.0 / 24.0;
+    let ray_origin = vec3<f32>(local_x, local_y, -0.6);
+    let ray_dir = normalize(vec3<f32>(view_dir.x * 0.4, view_dir.y * 0.15, 1.0));
 
     var accum_color = vec3<f32>(0.0);
     var accum_alpha = 0.0;
+    let steps = 32;
+    let step_size = 1.2 / f32(steps);
 
-    for (var i = 0; i < 24; i++) {
+    for (var i = 0; i < steps; i++) {
         let pos = ray_origin + ray_dir * (f32(i) * step_size);
         let d = fire_density(pos, tt);
         if d > 0.001 {
-            // Color from density: high density = white/yellow core, low = red
-            let col_core = vec3<f32>(1.0, 0.95, 0.8);
-            let col_mid = vec3<f32>(1.0, 0.45, 0.05);
-            let col_outer = vec3<f32>(0.9, 0.1, 0.0);
-            var fire_col: vec3<f32>;
-            if d > 0.6 {
-                fire_col = mix(col_mid, col_core, (d - 0.6) / 0.4);
-            } else {
-                fire_col = mix(col_outer, col_mid, d / 0.6);
-            }
-            // Additive emission accumulation — bright fire
-            let contrib = fire_col * d * step_size * 10.0;
-            accum_color += contrib * (1.0 - accum_alpha);
-            accum_alpha += d * step_size * 4.0 * (1.0 - accum_alpha);
+            let fc = fire_color(d, pos, tt);
+
+            // HDR emission — bright core for bloom
+            let emission = fc * d * step_size * 15.0;
+            accum_color += emission * (1.0 - accum_alpha);
+            accum_alpha += d * step_size * 5.0 * (1.0 - accum_alpha);
         }
-        if accum_alpha >= 0.95 { break; }
+        if accum_alpha >= 0.97 { break; }
     }
 
-    // Flicker
-    let flicker = 0.9 + 0.1 * sin(tt * 12.0 + uv.x * 5.0) * sin(tt * 7.0 + uv.y * 3.0);
+    // Ember particles — small bright dots
+    let ember_uv = uv * 8.0;
+    let ember_cell = floor(ember_uv);
+    let ember_hash = fract(sin(dot(ember_cell, vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let ember_y = fract(ember_hash * 3.0 - tt * (0.5 + ember_hash));
+    let ember_x = fract(ember_hash * 7.0) + sin(tt * 2.0 + ember_hash * 10.0) * 0.1;
+    let ember_dist = length(fract(ember_uv) - vec2<f32>(ember_x, ember_y));
+    let ember = smoothstep(0.05, 0.0, ember_dist) * step(0.7, ember_hash) * 0.5;
+    accum_color += vec3<f32>(1.0, 0.6, 0.1) * ember;
+    accum_alpha = max(accum_alpha, ember * 0.5);
+
+    // Multi-frequency flicker
+    let flicker = 0.85 + 0.15 * sin(tt * 15.0) * sin(tt * 9.3 + 1.7) * sin(tt * 23.0 + 3.1);
     accum_color *= flicker;
 
     let alpha = clamp(accum_alpha, 0.0, 1.0);
@@ -956,7 +993,7 @@ fn mat_neon(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
     let ring_r = 0.6;
     let ring_d = abs(dist_c - ring_r);
 
-    let core = smoothstep(0.02, 0.0, ring_d) * 3.0 * total_pulse;
+    let core = smoothstep(0.02, 0.0, ring_d) * 4.0 * total_pulse;
 
     let glow1 = exp(-ring_d * ring_d / 0.01) * total_pulse;
     let glow2 = exp(-ring_d * ring_d / 0.04) * 0.4 * total_pulse;
@@ -1207,7 +1244,7 @@ fn mat_lightning(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f3
     let base_col = vec3<f32>(0.3, 0.5, 1.0);
     let white_mix = smoothstep(0.5, 2.0, total);
     let core_col = mix(base_col, vec3<f32>(1.0), white_mix);
-    let final_c = core_col * total * 2.0;
+    let final_c = core_col * total * 3.0;
 
     let flicker = 0.8 + 0.2 * sin(tt * 30.0) * sin(tt * 17.0 + 1.3);
     let alpha = clamp(total * 2.0 * flicker, 0.0, 1.0);
@@ -1218,6 +1255,190 @@ fn mat_lightning(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f3
 //  Fragment shader — dispatch by kind
 // ════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════
+//  Mesh-normal versions — use real geometry normals for lighting
+// ════════════════════════════════════════════════════
+
+fn mat_bubble_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3<f32>) -> vec4<f32> {
+    let view_dir = normalize(ep - wp);
+    let n_dot_v = max(dot(n, view_dir), 0.0);
+    let fresnel = pow(1.0 - n_dot_v, 3.0);
+
+    // Front surface interference — position-based thickness
+    let p = uv * 2.0 - 1.0;
+    let thick_f = 400.0
+        + p.y * 300.0
+        + sin(p.x * 3.0 + p.y * 2.0 + t * 0.4) * 80.0
+        + sin(p.y * 7.0 + t * 0.7) * 40.0
+        + sin(p.x * 5.0 - p.y * 4.0 + t * 0.2) * 30.0;
+    let pd_f = 2.0 * 1.33 * thick_f;
+    let irid_f = vec3<f32>(
+        0.5 + 0.5 * cos(6.28318 * pd_f / 700.0),
+        0.5 + 0.5 * cos(6.28318 * pd_f / 530.0),
+        0.5 + 0.5 * cos(6.28318 * pd_f / 430.0),
+    );
+
+    // Back surface
+    let thick_b = thick_f + 150.0 + sin(p.x * 4.0 - p.y * 3.0 - t * 0.3) * 50.0;
+    let pd_b = 2.0 * 1.33 * thick_b;
+    let irid_b = vec3<f32>(
+        0.5 + 0.5 * cos(6.28318 * pd_b / 700.0),
+        0.5 + 0.5 * cos(6.28318 * pd_b / 530.0),
+        0.5 + 0.5 * cos(6.28318 * pd_b / 430.0),
+    );
+
+    let range_f = max(max(irid_f.x, irid_f.y), irid_f.z) - min(min(irid_f.x, irid_f.y), irid_f.z);
+    let mask_f = smoothstep(0.7, 0.95, range_f) * (0.005 + fresnel * 0.025);
+    let range_b = max(max(irid_b.x, irid_b.y), irid_b.z) - min(min(irid_b.x, irid_b.y), irid_b.z);
+    let mask_b = smoothstep(0.7, 0.95, range_b) * (0.003 + fresnel * 0.012);
+
+    // Specular
+    let light = normalize(vec3<f32>(0.3, 1.0, 0.6));
+    let h = normalize(light + view_dir);
+    let spec_f = pow(max(dot(n, h), 0.0), 256.0) * 0.7;
+    let spec_b = pow(max(dot(-n, h), 0.0), 128.0) * 0.1;
+
+    let sheen = fresnel * vec3<f32>(0.2, 0.25, 0.35) * 0.08;
+    let light2 = normalize(vec3<f32>(-0.6, 0.5, 0.3));
+    let h2 = normalize(light2 + view_dir);
+    let spec2 = pow(max(dot(n, h2), 0.0), 180.0) * 0.3;
+
+    let bands = irid_f * mask_f + irid_b * mask_b;
+    let band_lum = max(bands.x, max(bands.y, bands.z));
+    let shell_alpha = 0.025;
+    let shell_color = vec3<f32>(0.15, 0.18, 0.25) * shell_alpha;
+
+    let emit = shell_color + sheen + bands + vec3<f32>(spec_f + spec_b + spec2);
+    let a = shell_alpha + band_lum + spec_f + spec_b + spec2;
+    return vec4<f32>(emit, a);
+}
+
+fn mat_glass_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3<f32>) -> vec4<f32> {
+    let view_dir = normalize(ep - wp);
+    let n_dot_v = max(dot(n, view_dir), 0.0);
+    let fresnel = pow(1.0 - n_dot_v, 4.0) * 0.8 + 0.1;
+
+    let refract_offset = n.xy * 0.1;
+    let refracted_uv = uv + refract_offset;
+    let pattern = sin(refracted_uv.x * 20.0 + t * 0.5) * sin(refracted_uv.y * 15.0 + t * 0.3) * 0.5 + 0.5;
+    let caustic = pow(max(pattern, 0.0), 3.0) * 0.3;
+
+    let light = normalize(vec3<f32>(0.3, 0.8, 0.5));
+    let h = normalize(light + view_dir);
+    let spec = pow(max(dot(n, h), 0.0), 512.0) * 1.2;
+    let spec2 = pow(max(dot(n, h), 0.0), 64.0) * 0.2;
+
+    let base_color = vec3<f32>(0.12, 0.16, 0.25);
+    let reflect_color = vec3<f32>(0.3, 0.4, 0.6);
+
+    let refl_dir = reflect(-view_dir, n);
+    let env = env_reflect(refl_dir, t);
+
+    var color = mix(base_color * (0.3 + caustic), env * 0.6, fresnel);
+    color += vec3<f32>(spec + spec2);
+
+    // Rim light
+    let rim = pow(1.0 - n_dot_v, 6.0);
+    color += vec3<f32>(0.4, 0.5, 0.7) * rim * 0.2;
+
+    // Streak
+    let streak_pos = fract(t * 0.08) * 3.0 - 1.0;
+    let streak = exp(-pow(uv.x * 0.5 + uv.y * 0.5 - streak_pos, 2.0) * 400.0) * 0.3;
+    color += vec3<f32>(streak);
+
+    let alpha = 0.2 + fresnel * 0.5 + spec * 0.3;
+    return vec4<f32>(color, clamp(alpha, 0.0, 1.0));
+}
+
+fn mat_metal_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3<f32>) -> vec4<f32> {
+    let view_dir = normalize(ep - wp);
+    let n_dot_v = max(dot(n, view_dir), 0.001);
+
+    let base_col = vec3<f32>(0.8, 0.75, 0.65);
+
+    // Anisotropic scratch direction
+    let angle = 0.8;
+    let scratch_uv = vec2<f32>(
+        dot(uv * 2.0 - 1.0, vec2<f32>(cos(angle), sin(angle))),
+        dot(uv * 2.0 - 1.0, vec2<f32>(-sin(angle), cos(angle)))
+    );
+    let scratch = vnoise(vec2<f32>(scratch_uv.x * 2.0, scratch_uv.y * 40.0)) * 0.08;
+
+    // 3-light setup using mesh normal
+    let lights = array<vec3<f32>, 3>(
+        normalize(vec3<f32>(0.5, 0.8, 0.6)),
+        normalize(vec3<f32>(-0.7, 0.3, 0.5)),
+        normalize(vec3<f32>(0.0, -0.5, 0.8))
+    );
+    let lcols = array<vec3<f32>, 3>(
+        vec3<f32>(1.0, 0.95, 0.9),
+        vec3<f32>(0.7, 0.8, 1.0),
+        vec3<f32>(0.9, 0.85, 0.8)
+    );
+
+    var total_spec = vec3<f32>(0.0);
+    var total_diff = vec3<f32>(0.0);
+
+    for (var i = 0; i < 3; i++) {
+        let L = lights[i];
+        let H = normalize(L + view_dir);
+        let ndl = max(dot(n, L), 0.0);
+        let ndh = max(dot(n, H), 0.0);
+        let D = pow(ndh, 64.0) * 2.0;
+        let f0 = 0.8;
+        let fres = f0 + (1.0 - f0) * pow(1.0 - max(dot(H, view_dir), 0.0), 5.0);
+        total_spec += lcols[i] * D * fres * ndl;
+        total_diff += lcols[i] * ndl * 0.15;
+    }
+
+    let refl_dir = reflect(-view_dir, n);
+    let env = env_reflect(refl_dir, t) * 1.5;
+
+    let ambient = base_col * 0.12;
+    var color = ambient + base_col * total_diff + total_spec * base_col + env * base_col * 0.5;
+    color += vec3<f32>(scratch) * base_col;
+    color *= (0.7 + 0.3 * smoothstep(0.0, 0.3, n_dot_v));
+
+    return vec4<f32>(color, 1.0);
+}
+
+fn mat_crystal_mesh(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32, n: vec3<f32>) -> vec4<f32> {
+    let view_dir = normalize(ep - wp);
+    let n_dot_v = max(dot(n, view_dir), 0.0);
+    let fresnel = pow(1.0 - n_dot_v, 3.0) * 0.6 + 0.2;
+
+    // Faceted refraction — perturb normal with noise
+    let facet_noise = vnoise(uv * 15.0) * 0.3;
+    let perturbed_n = normalize(n + vec3<f32>(facet_noise, facet_noise * 0.7, -facet_noise * 0.5));
+
+    // Internal glow
+    let internal = vec3<f32>(0.6, 0.4, 0.8) * (0.2 + 0.1 * sin(t * 1.5 + uv.x * 5.0));
+
+    // Specular sparkles
+    let light = normalize(vec3<f32>(0.5, 0.8, 0.3));
+    let h = normalize(light + view_dir);
+    let spec1 = pow(max(dot(perturbed_n, h), 0.0), 256.0) * 1.5;
+    let light2 = normalize(vec3<f32>(-0.3, 0.5, -0.7));
+    let h2 = normalize(light2 + view_dir);
+    let spec2 = pow(max(dot(perturbed_n, h2), 0.0), 128.0) * 0.6;
+
+    // Rainbow dispersion at edges
+    let dispersion = fresnel * vec3<f32>(
+        0.3 + 0.3 * sin(n_dot_v * 10.0 + t),
+        0.3 + 0.3 * sin(n_dot_v * 10.0 + t + 2.1),
+        0.3 + 0.3 * sin(n_dot_v * 10.0 + t + 4.2),
+    );
+
+    // Environment reflection
+    let refl_dir = reflect(-view_dir, perturbed_n);
+    let env = env_reflect(refl_dir, t);
+
+    var color = internal * (1.0 - fresnel) + env * fresnel + dispersion;
+    color += vec3<f32>(spec1 + spec2);
+
+    return vec4<f32>(color, 0.8 + fresnel * 0.2);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv;
@@ -1226,10 +1447,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let t = camera.time;
     let k = u32(in.kind + 0.5);
 
+    let wn = normalize(in.world_normal);
+
     var col: vec4<f32>;
     switch k {
-        case 0u:  { col = mat_bubble(uv, wp, ep, t); }
-        case 1u:  { col = mat_glass(uv, wp, ep, t); }
+        case 0u:  { col = mat_bubble_mesh(uv, wp, ep, t, wn); }
+        case 1u:  { col = mat_glass_mesh(uv, wp, ep, t, wn); }
         case 2u:  { col = mat_portal(uv, wp, ep, t); }
         case 3u:  { col = mat_grid(uv, wp, ep, t); }
         case 4u:  { col = mat_water(uv, wp, ep, t); }
@@ -1237,8 +1460,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         case 6u:  { col = mat_smoke(uv, wp, ep, t); }
         case 7u:  { col = mat_aurora(uv, wp, ep, t); }
         case 8u:  { col = mat_hologram(uv, wp, ep, t); }
-        case 9u:  { col = mat_crystal(uv, wp, ep, t); }
-        case 10u: { col = mat_metal(uv, wp, ep, t); }
+        case 9u:  { col = mat_crystal_mesh(uv, wp, ep, t, wn); }
+        case 10u: { col = mat_metal_mesh(uv, wp, ep, t, wn); }
         case 11u: { col = mat_neon(uv, wp, ep, t); }
         case 12u: { col = mat_shield(uv, wp, ep, t); }
         case 13u: { col = mat_warp(uv, wp, ep, t); }
