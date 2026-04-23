@@ -12,16 +12,22 @@ struct Camera {
 var<uniform> camera: Camera;
 
 // ════════════════════════════════════════════════════
-//  Quad Instance
+//  Mesh Vertex + Instance
 // ════════════════════════════════════════════════════
 
-struct QuadInstance {
-    @location(0) model_0: vec4<f32>,
-    @location(1) model_1: vec4<f32>,
-    @location(2) model_2: vec4<f32>,
-    @location(3) model_3: vec4<f32>,
-    @location(4) kind: f32,
-    @location(5) _pad: vec3<f32>,
+struct MeshVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+}
+
+struct InstanceInput {
+    @location(3) model_0: vec4<f32>,
+    @location(4) model_1: vec4<f32>,
+    @location(5) model_2: vec4<f32>,
+    @location(6) model_3: vec4<f32>,
+    @location(7) kind: f32,
+    @location(8) _pad: vec3<f32>,
 }
 
 struct VertexOutput {
@@ -29,55 +35,21 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) world_pos: vec3<f32>,
     @location(2) kind: f32,
-    @location(3) face_id: f32,
-}
-
-// 36 verts = 6 faces × 2 tris × 3 verts (box)
-const BOX_DEPTH: f32 = 0.4;
-
-var<private> QUAD2D: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
-    vec2<f32>(-0.5, -0.5),
-    vec2<f32>( 0.5, -0.5),
-    vec2<f32>( 0.5,  0.5),
-    vec2<f32>(-0.5, -0.5),
-    vec2<f32>( 0.5,  0.5),
-    vec2<f32>(-0.5,  0.5),
-);
-
-fn box_vertex(vi: u32) -> vec4<f32> {
-    let face = vi / 6u;
-    let corner = QUAD2D[vi % 6u];
-    let h = 0.5;
-    let d = BOX_DEPTH * 0.5;
-    switch face {
-        case 0u: { return vec4<f32>(corner.x, corner.y, d, 0.0); }   // front
-        case 1u: { return vec4<f32>(-corner.x, corner.y, -d, 1.0); } // back
-        case 2u: { return vec4<f32>(h, corner.x, corner.y * BOX_DEPTH, 2.0); }  // right
-        case 3u: { return vec4<f32>(-h, -corner.x, corner.y * BOX_DEPTH, 3.0); } // left
-        case 4u: { return vec4<f32>(corner.x, h, -corner.y * BOX_DEPTH, 4.0); } // top
-        case 5u: { return vec4<f32>(corner.x, -h, corner.y * BOX_DEPTH, 5.0); } // bottom
-        default: { return vec4<f32>(0.0); }
-    }
+    @location(3) world_normal: vec3<f32>,
 }
 
 @vertex
-fn vs_main(
-    @builtin(vertex_index) vi: u32,
-    inst: QuadInstance,
-) -> VertexOutput {
+fn vs_main(vert: MeshVertexInput, inst: InstanceInput) -> VertexOutput {
     let model = mat4x4<f32>(inst.model_0, inst.model_1, inst.model_2, inst.model_3);
-    let bv = box_vertex(vi);
-    let local = vec4<f32>(bv.x, bv.y, bv.z, 1.0);
-    let world = model * local;
-
-    let corner = QUAD2D[vi % 6u];
+    let world = model * vec4<f32>(vert.position, 1.0);
+    let world_normal = normalize((model * vec4<f32>(vert.normal, 0.0)).xyz);
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * world;
-    out.uv = corner + 0.5; // 0-1 UV
+    out.uv = vert.uv;
     out.world_pos = world.xyz;
     out.kind = inst.kind;
-    out.face_id = bv.w;
+    out.world_normal = world_normal;
     return out;
 }
 
@@ -491,45 +463,54 @@ fn water_caustics(p: vec2<f32>, t: f32) -> f32 {
 }
 
 fn mat_water(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
-    let p = (uv - 0.5) * 2.0;
-    let dist = length(p);
-    let edge = 1.0 - smoothstep(0.85, 1.0, dist);
+    let uv_cent = uv - 0.5;
+    let dist = length(uv_cent) * 2.0;
+    // Circular mask
+    let edge = 1.0 - smoothstep(0.9, 1.0, dist);
     if edge <= 0.0 { return vec4<f32>(0.0); }
 
-    let tt = t * 0.8;
-    let eps = 0.01;
-    let h_c = wave_height(uv, tt);
-    let h_r = wave_height(uv + vec2<f32>(eps, 0.0), tt);
-    let h_u = wave_height(uv + vec2<f32>(0.0, eps), tt);
-    let normal = normalize(vec3<f32>((h_c - h_r) / eps * 0.15, (h_c - h_u) / eps * 0.15, 1.0));
+    let tt = t * 0.6;
 
-    let view_dir = normalize(ep - wp);
-    let n_dot_v = max(dot(vec3<f32>(normal.x, normal.z, normal.y), view_dir), 0.0);
-    let fresnel = pow(1.0 - n_dot_v, 4.0) * 0.8 + 0.2;
+    // Wave normal via central difference
+    let eps = 0.008;
+    let h_c = wave_height(uv * 2.0, tt);
+    let h_r = wave_height((uv + vec2<f32>(eps, 0.0)) * 2.0, tt);
+    let h_u = wave_height((uv + vec2<f32>(0.0, eps)) * 2.0, tt);
+    let normal = normalize(vec3<f32>((h_c - h_r) / eps * 0.3, 1.0, (h_c - h_u) / eps * 0.3));
 
-    let depth_f = exp(-dist * 1.0);
-    let deep = vec3<f32>(0.03, 0.08, 0.24);
-    let shallow = vec3<f32>(0.1, 0.3, 0.6);
-    let base = mix(deep, shallow, depth_f);
+    // Fresnel
+    let view_dir = normalize(vec3<f32>(0.0, 1.0, 0.3));
+    let n_dot_v = max(dot(normal, view_dir), 0.0);
+    let fresnel = pow(1.0 - n_dot_v, 5.0) * 0.7 + 0.1;
 
-    let c_uv = uv + normal.xy * 0.05;
-    let caustic = water_caustics(c_uv, tt * 0.8) * 0.6;
-    let caustic_col = vec3<f32>(0.3, 0.7, 0.9) * caustic * depth_f;
+    // Deep ocean color
+    let deep = vec3<f32>(0.01, 0.04, 0.15);
+    let mid = vec3<f32>(0.02, 0.12, 0.35);
+    let shallow = vec3<f32>(0.05, 0.25, 0.5);
+    let depth_t = 0.5 + h_c * 0.3;
+    let base = mix(deep, mix(mid, shallow, depth_t), depth_t);
 
-    let light = normalize(vec3<f32>(0.3, 0.8, 0.5));
+    // Strong caustics
+    let c_uv = uv * 2.0 + normal.xz * 0.1;
+    let caustic = water_caustics(c_uv, tt) * 1.2;
+    let caustic_col = vec3<f32>(0.15, 0.5, 0.7) * caustic;
+
+    // Specular — sun reflection on water
+    let light = normalize(vec3<f32>(0.2, 0.9, 0.3));
     let hv = normalize(light + view_dir);
-    let spec_n = vec3<f32>(normal.x, normal.z, normal.y);
-    let spec = pow(max(dot(spec_n, hv), 0.0), 64.0) * 0.6;
-    let spec2 = pow(max(dot(spec_n, hv), 0.0), 256.0) * 0.3;
+    let spec = pow(max(dot(normal, hv), 0.0), 128.0) * 0.8;
+    // Secondary scattered highlights
+    let spec2 = pow(max(dot(normal, hv), 0.0), 32.0) * 0.15;
 
-    let sky = vec3<f32>(0.4, 0.6, 0.9);
-    let reflect_c = mix(base, sky, fresnel * 0.6);
+    // Sky reflection
+    let sky = vec3<f32>(0.2, 0.35, 0.6);
+    var color = mix(base, sky, fresnel * 0.5) + caustic_col + vec3<f32>(spec + spec2);
 
-    var final_c = reflect_c + caustic_col + vec3<f32>(spec + spec2);
-    let foam = smoothstep(0.3, 0.5, h_c) * 0.15;
-    final_c = mix(final_c, vec3<f32>(0.9, 0.95, 1.0), foam);
+    // Foam on wave crests
+    let foam = smoothstep(0.25, 0.45, h_c) * 0.2;
+    color = mix(color, vec3<f32>(0.8, 0.9, 0.95), foam);
 
-    return vec4<f32>(final_c, 0.9 * edge);
+    return vec4<f32>(color, edge * 0.95);
 }
 
 // ════════════════════════════════════════════════════
@@ -560,15 +541,19 @@ fn mat_fire(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
     let vert_fade = 1.0 - pow(uv.y, 1.5);
     if shape * vert_fade <= 0.01 { return vec4<f32>(0.0); }
 
-    // Map UV to 3D volume: x in [-1,1], y in [0,1], z = depth march
-    let ray_origin = vec3<f32>((uv.x - 0.5) * 2.0, 1.0 - uv.y, -0.5);
-    let ray_dir = vec3<f32>(0.0, 0.0, 1.0);
-    let step_size = 1.0 / 20.0;
+    // Ray from camera through volume — gives parallax/3D feel
+    let view_dir = normalize(wp - ep);
+    let local_x = (uv.x - 0.5) * 2.0;
+    let local_y = 1.0 - uv.y;
+    let ray_origin = vec3<f32>(local_x, local_y, -0.5);
+    // March along view direction projected into local volume space
+    let ray_dir = normalize(vec3<f32>(view_dir.x * 0.3, view_dir.y * 0.1, 1.0));
+    let step_size = 1.0 / 24.0;
 
     var accum_color = vec3<f32>(0.0);
     var accum_alpha = 0.0;
 
-    for (var i = 0; i < 20; i++) {
+    for (var i = 0; i < 24; i++) {
         let pos = ray_origin + ray_dir * (f32(i) * step_size);
         let d = fire_density(pos, tt);
         if d > 0.001 {
@@ -582,10 +567,10 @@ fn mat_fire(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
             } else {
                 fire_col = mix(col_outer, col_mid, d / 0.6);
             }
-            // Additive emission accumulation
-            let contrib = fire_col * d * step_size * 6.0;
+            // Additive emission accumulation — bright fire
+            let contrib = fire_col * d * step_size * 10.0;
             accum_color += contrib * (1.0 - accum_alpha);
-            accum_alpha += d * step_size * 3.0 * (1.0 - accum_alpha);
+            accum_alpha += d * step_size * 4.0 * (1.0 - accum_alpha);
         }
         if accum_alpha >= 0.95 { break; }
     }
@@ -945,9 +930,12 @@ fn mat_metal(uv: vec2<f32>, wp: vec3<f32>, ep: vec3<f32>, t: f32) -> vec4<f32> {
     let metal_env = env_reflect(refl_dir, t) * 1.5;
     let env_r = metal_env * (1.0 - roughness * 0.7);
 
-    var color = base_col * total_diff + total_spec * base_col + env_r * base_col;
+    // Ambient + diffuse + specular + environment
+    let ambient = base_col * 0.15;
+    var color = ambient + base_col * total_diff + total_spec * base_col + env_r * base_col;
     color += vec3<f32>(scratch) * base_col;
-    color *= (0.5 + 0.5 * smoothstep(0.0, 0.3, n_dot_v));
+    // Darken edges slightly for shape, but keep opaque
+    color *= (0.7 + 0.3 * smoothstep(0.0, 0.3, n_dot_v));
 
     return vec4<f32>(color, 1.0);
 }
@@ -1237,16 +1225,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let ep = camera.eye_pos;
     let t = camera.time;
     let k = u32(in.kind + 0.5);
-    let face = u32(in.face_id + 0.5);
-
-    // Billboard materials — only render front face, discard box sides
-    // Spheres: Bubble(0), Glass(1), Crystal(9), Metal(10), Shield(12)
-    // Flat effects: Fire(5), Smoke(6), Lightning(15), Aurora(7), Neon(11)
-    if (k == 0u || k == 1u || k == 5u || k == 6u || k == 7u
-        || k == 9u || k == 10u || k == 11u || k == 12u || k == 15u)
-        && face > 0u {
-        discard;
-    }
 
     var col: vec4<f32>;
     switch k {

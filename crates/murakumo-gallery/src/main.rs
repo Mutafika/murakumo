@@ -1,5 +1,6 @@
 use glam::{Mat4, Vec3};
 use sabitori::*;
+use seimei::procedural;
 use web_time::Instant;
 use wgpu::util::DeviceExt;
 
@@ -17,6 +18,48 @@ const GRID_ROWS: usize = 4;
 const QUAD_SIZE: f32 = 1.2;
 const SPACING: f32 = 1.8;
 
+// ── Mesh Vertex (position + normal + uv) ──
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+    uv: [f32; 2],
+}
+
+impl MeshVertex {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRS: &[wgpu::VertexAttribute] = &[
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 24, shader_location: 2 },
+        ];
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<MeshVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: ATTRS,
+        }
+    }
+}
+
+fn render_mesh_to_vertices(mesh: &seimei::RenderMesh) -> Vec<MeshVertex> {
+    mesh.vertices.iter().map(|v| MeshVertex {
+        position: [v.position.x as f32, v.position.y as f32, v.position.z as f32],
+        normal: [v.normal.x as f32, v.normal.y as f32, v.normal.z as f32],
+        uv: v.uv,
+    }).collect()
+}
+
+// ── GPU Mesh Group (shared geometry for multiple materials) ──
+
+struct MeshGroup {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    material_indices: Vec<usize>,
+}
+
 // ── GPU Instance Data ──
 
 #[repr(C)]
@@ -33,12 +76,12 @@ struct QuadInstance {
 impl QuadInstance {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         const ATTRS: &[wgpu::VertexAttribute] = &[
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 3 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 64, shader_location: 4 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 68, shader_location: 5 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 3 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 4 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 5 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 6 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 64, shader_location: 7 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 68, shader_location: 8 },
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadInstance>() as u64,
@@ -593,6 +636,7 @@ struct GalleryApp {
     camera_buffer: Option<wgpu::Buffer>,
     camera_bind_group: Option<wgpu::BindGroup>,
     instance_buffer: Option<wgpu::Buffer>,
+    mesh_groups: Vec<MeshGroup>,
     // Post-processing
     bloom: Option<BloomResources>,
     // State
@@ -612,6 +656,7 @@ impl GalleryApp {
             camera_buffer: None,
             camera_bind_group: None,
             instance_buffer: None,
+            mesh_groups: Vec::new(),
             bloom: None,
             time: 0.0,
             start: Instant::now(),
@@ -633,43 +678,39 @@ impl GalleryApp {
 
             let bob = (self.time * 1.0 + i as f32 * 0.4).sin() * 0.04;
 
-            // Per-material shape, rotation, scale
+            // Per-material shape + rotation
+            // Normalize: icosphere r=1 → 0.55, cube 1.0 → 1.1, cylinder → 1.2, plane → 1.1, torus → 1.8
             let (scale, rot_speed, tilt) = match i {
-                // Sphere materials — square, slow spin
-                0 => (Vec3::splat(1.3), 0.15, 0.0),           // Bubble
-                1 => (Vec3::splat(1.2), 0.2, 0.1),            // Glass
-                9 => (Vec3::splat(1.1), 0.25, 0.15),           // Crystal
-                10 => (Vec3::splat(1.2), 0.3, 0.05),           // Metal
-                12 => (Vec3::splat(1.3), 0.1, 0.0),            // Shield
+                // Icosphere (raw diameter=2) → scale 0.55 ≈ display size 1.1
+                0 => (Vec3::splat(0.55), 0.15, 0.0),       // Bubble
+                1 => (Vec3::splat(0.55), 0.12, 0.0),       // Glass
+                9 => (Vec3::splat(0.55), 0.18, 0.1),       // Crystal
+                10 => (Vec3::splat(0.55), 0.1, 0.0),       // Metal
+                12 => (Vec3::splat(0.55), 0.15, 0.05),     // Shield
+                4 => (Vec3::splat(0.55), 0.1, 0.0),        // Water
 
-                // Tall vertical — fire, smoke, lightning
-                5 => (Vec3::new(0.8, 1.4, 0.8), 0.0, 0.0),    // Fire (no spin)
-                6 => (Vec3::new(0.9, 1.3, 0.9), 0.05, 0.0),   // Smoke
-                15 => (Vec3::new(0.7, 1.5, 0.3), 0.0, 0.0),   // Lightning
+                // Cube (raw size=1) → scale 1.1
+                2 => (Vec3::splat(1.1), 0.35, 0.0),       // Portal
+                3 => (Vec3::splat(1.0), 0.1, 0.4),        // Grid
+                8 => (Vec3::splat(1.0), 0.4, 0.05),       // Hologram
+                13 => (Vec3::splat(1.0), 0.3, 0.1),       // Warp
+                14 => (Vec3::splat(1.0), 0.2, 0.0),       // Dissolve
 
-                // Wide horizontal — water, grid, aurora
-                4 => (Vec3::new(1.4, 0.9, 1.0), 0.15, 0.3),   // Water (tilted)
-                3 => (Vec3::new(1.3, 0.8, 1.0), 0.1, 0.4),    // Grid (tilted)
-                7 => (Vec3::new(1.5, 0.8, 0.3), 0.0, 0.0),    // Aurora (wide flat)
+                // Cylinder (raw r=0.5, h=1.0) → scale to match
+                5 => (Vec3::new(1.0, 1.5, 1.0), 0.05, 0.0),  // Fire (taller)
+                6 => (Vec3::new(1.1, 1.3, 1.1), 0.03, 0.0),  // Smoke
 
-                // Portal — flat disc, slow spin
-                2 => (Vec3::new(1.2, 1.2, 0.15), 0.35, 0.0),  // Portal
+                // Plane (raw 1x1) → scale up
+                7 => (Vec3::new(1.3, 1.0, 1.3), 0.08, 0.3),  // Aurora
+                15 => (Vec3::new(1.1, 1.0, 1.1), 0.05, 0.2), // Lightning
 
-                // Neon — square, medium spin
-                11 => (Vec3::new(1.1, 1.1, 0.2), 0.2, 0.1),   // Neon
+                // Torus (raw R=0.4) → scale 1.8
+                11 => (Vec3::splat(1.8), 0.2, 0.0),       // Neon
 
-                // Hologram — tall box
-                8 => (Vec3::new(0.9, 1.2, 0.9), 0.4, 0.05),   // Hologram
-
-                // Effects — cubes
-                13 => (Vec3::splat(1.0), 0.3, 0.1),            // Warp
-                14 => (Vec3::splat(1.1), 0.2, 0.0),            // Dissolve
-
-                _ => (Vec3::splat(QUAD_SIZE), 0.2, 0.0),
+                _ => (Vec3::splat(1.0), 0.2, 0.0),
             };
 
             let yaw = self.time * rot_speed + i as f32 * 0.5;
-
             let model = Mat4::from_translation(Vec3::new(x, y + bob, 0.0))
                 * Mat4::from_rotation_y(yaw)
                 * Mat4::from_rotation_x(tilt)
@@ -856,14 +897,48 @@ impl SceneApp for GalleryApp {
 
         let target_format = ctx.surface_format;
 
-        // Main material pipeline
+        // Generate meshes per shape type and create MeshGroups
+        let mesh_defs: Vec<(seimei::RenderMesh, Vec<usize>)> = vec![
+            // Icosphere: Bubble(0), Glass(1), Crystal(9), Metal(10), Shield(12), Water(4)
+            (procedural::icosphere(1.0, 3), vec![0, 1, 9, 10, 12, 4]),
+            // Cube: Portal(2), Grid(3), Hologram(8), Warp(13), Dissolve(14)
+            (procedural::cube(1.0), vec![2, 3, 8, 13, 14]),
+            // Cylinder: Fire(5), Smoke(6)
+            (procedural::cylinder(0.5, 1.0, 32), vec![5, 6]),
+            // Plane: Aurora(7), Lightning(15)
+            (procedural::plane(1.0, 1.0, 8, 8), vec![7, 15]),
+            // Torus: Neon(11)
+            (procedural::torus(0.4, 0.15, 32, 16), vec![11]),
+        ];
+
+        let mesh_groups: Vec<MeshGroup> = mesh_defs.into_iter().map(|(mesh, mat_indices)| {
+            let verts = render_mesh_to_vertices(&mesh);
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh_vertex_buffer"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh_index_buffer"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            MeshGroup {
+                vertex_buffer,
+                index_buffer,
+                index_count: mesh.indices.len() as u32,
+                material_indices: mat_indices,
+            }
+        }).collect();
+
+        // Main material pipeline (two vertex buffers: mesh + instance)
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("gallery_material_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[QuadInstance::layout()],
+                buffers: &[MeshVertex::layout(), QuadInstance::layout()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -952,7 +1027,7 @@ impl SceneApp for GalleryApp {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[QuadInstance::layout()],
+                buffers: &[MeshVertex::layout(), QuadInstance::layout()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1022,6 +1097,7 @@ impl SceneApp for GalleryApp {
         self.camera_buffer = Some(camera_buffer);
         self.camera_bind_group = Some(camera_bg);
         self.instance_buffer = Some(instance_buffer);
+        self.mesh_groups = mesh_groups;
         self.bloom = Some(bloom);
     }
 
@@ -1085,8 +1161,14 @@ impl SceneApp for GalleryApp {
 
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, camera_bg, &[]);
-                pass.set_vertex_buffer(0, instance_buffer.slice(..));
-                pass.draw(0..36, 0..16);
+                for group in &self.mesh_groups {
+                    pass.set_vertex_buffer(0, group.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, instance_buffer.slice(..));
+                    pass.set_index_buffer(group.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    for &mat_idx in &group.material_indices {
+                        pass.draw_indexed(0..group.index_count, 0, mat_idx as u32..mat_idx as u32 + 1);
+                    }
+                }
             }
 
             // 2. Bloom: extract + blur + composite to surface
@@ -1124,8 +1206,14 @@ impl SceneApp for GalleryApp {
 
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, camera_bg, &[]);
-                pass.set_vertex_buffer(0, instance_buffer.slice(..));
-                pass.draw(0..36, 0..16);
+                for group in &self.mesh_groups {
+                    pass.set_vertex_buffer(0, group.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, instance_buffer.slice(..));
+                    pass.set_index_buffer(group.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    for &mat_idx in &group.material_indices {
+                        pass.draw_indexed(0..group.index_count, 0, mat_idx as u32..mat_idx as u32 + 1);
+                    }
+                }
             }
         }
     }
