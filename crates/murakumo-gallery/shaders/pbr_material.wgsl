@@ -723,57 +723,88 @@ fn water_caustics(p: vec2<f32>, t: f32) -> f32 {
 
 fn mat_water(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResult {
     var r: MaterialResult;
-    // Tunable params
-    let p_amp     = max(mp(4u, 0u), 0.0);
-    let p_freq    = max(mp(4u, 1u), 0.1);
-    let p_speed   = max(mp(4u, 2u), 0.0);
-    let p_depth   = max(mp(4u, 3u), 0.0);
-    let p_caustic = max(mp(4u, 4u), 0.0);
-
     let view_dir = normalize(ep - wp);
-    let tt = t * 0.6 * p_speed;
+    let tt = t * 0.5;
+    let is_flat = abs(n.y) > 0.9;
 
-    // Use world normal for water wave coordinates (sphere has continuous normals)
-    let wave_p = n.xz * 2.0 * p_freq;
-    let eps = 0.008;
-    let h_c = wave_height(wave_p, tt) * p_amp;
-    let h_r = wave_height(wave_p + vec2<f32>(eps, 0.0), tt) * p_amp;
-    let h_u = wave_height(wave_p + vec2<f32>(0.0, eps), tt) * p_amp;
-    // Perturb mesh normal with wave normal
-    let wave_n = normalize(vec3<f32>((h_c - h_r) / eps * 0.3, 1.0, (h_c - h_u) / eps * 0.3));
-    // Combine with mesh normal using TBN-like approach
-    let up = abs(n.y) > 0.999;
-    var tangent: vec3<f32>;
-    if up { tangent = vec3<f32>(1.0, 0.0, 0.0); } else { tangent = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), n)); }
-    let bitangent = cross(n, tangent);
-    let perturbed_n = normalize(tangent * wave_n.x + n * wave_n.y + bitangent * wave_n.z);
+    // ── Wave coordinates ──
+    var wave_p: vec2<f32>;
+    if is_flat { wave_p = wp.xz * 0.6; } else { wave_p = n.xz * 2.0; }
+
+    // ── Subtle wave normals ──
+    let eps = 0.01;
+    let h_c = wave_height(wave_p, tt) * 0.25;
+    let h_r = wave_height(wave_p + vec2(eps, 0.0), tt) * 0.25;
+    let h_u = wave_height(wave_p + vec2(0.0, eps), tt) * 0.25;
+    let wave_n = normalize(vec3<f32>((h_c - h_r) / eps * 0.12, 1.0, (h_c - h_u) / eps * 0.12));
+
+    var perturbed_n: vec3<f32>;
+    if is_flat { perturbed_n = wave_n; }
+    else {
+        let tng = normalize(cross(vec3(0.0, 1.0, 0.0), n));
+        perturbed_n = normalize(tng * wave_n.x + n * wave_n.y + cross(n, tng) * wave_n.z);
+    }
 
     let n_dot_v = max(dot(perturbed_n, view_dir), 0.0);
-    let fresnel = pow(1.0 - n_dot_v, 5.0) * 0.7 + 0.1;
+    let fresnel = pow(1.0 - n_dot_v, 5.0) * 0.65 + 0.04;
 
-    let deep = vec3<f32>(0.005, 0.03, 0.12) / max(p_depth, 0.05);
-    let mid = vec3<f32>(0.02, 0.10, 0.30);
-    let shallow = vec3<f32>(0.06, 0.28, 0.55);
-    let depth_t = 0.5 + h_c * 0.3;
-    let base = mix(deep, mix(mid, shallow, depth_t), depth_t * (0.5 + p_depth * 0.5));
+    // ── Depth ──
+    var depth: f32;
+    if is_flat {
+        let pc = vec2<f32>(0.4, 0.2);
+        let et = clamp(length(wp.xz - pc) / 1.4, 0.0, 1.0);
+        depth = (1.0 - et) * (1.0 - et);
+    } else { depth = 0.5; }
 
-    let c_uv = wave_p + perturbed_n.xz * 0.15;
-    let caustic = water_caustics(c_uv, tt) * 1.8 * p_caustic;
-    let caustic_col = vec3<f32>(0.2, 0.6, 0.8) * caustic;
+    // ── Bottom visible through water (eval rock beneath) ──
+    let refr_off = perturbed_n.xz * 0.04 * depth;
+    var bottom_coord: vec3<f32>;
+    if is_flat {
+        bottom_coord = normalize(vec3((wp.x + refr_off.x) * 0.3, (wp.z + refr_off.y) * 0.3, 0.5));
+    } else { bottom_coord = n; }
+    let bottom = eval_rock(bottom_coord, 3.0);
 
+    // Beer's law absorption: red absorbed first, blue least
+    let absorption = exp(-depth * 3.0 * vec3<f32>(2.5, 0.8, 0.4));
+    let bottom_seen = bottom.albedo * absorption;
+
+    // Subtle caustics on the bottom
+    let c_uv = wave_p * 2.0 + perturbed_n.xz * 0.06;
+    let caustic = water_caustics(c_uv, tt) * 0.3 * (1.0 - depth);
+    let bottom_lit = bottom_seen + vec3(caustic * 0.08, caustic * 0.15, caustic * 0.2);
+
+    // ── Sky reflection ──
     let refl_dir = reflect(-view_dir, perturbed_n);
-    let env = env_reflect(refl_dir, t);
-    let sky = vec3<f32>(0.15, 0.3, 0.55);
-    let foam = smoothstep(0.2, 0.4, h_c) * 0.3;
+    let sky_up = smoothstep(-0.1, 0.4, refl_dir.y);
+    let sky = mix(vec3<f32>(0.06, 0.1, 0.18), vec3<f32>(0.18, 0.3, 0.5), sky_up);
 
-    var color = mix(base, mix(sky, env, 0.3), fresnel * 0.6) + caustic_col;
-    color = mix(color, vec3<f32>(0.85, 0.92, 0.97), foam);
+    // ── Sun glint (sharp) ──
+    let light_dir = normalize(vec3<f32>(0.5, 0.8, 0.6));
+    let half_v = normalize(light_dir + view_dir);
+    let spec = pow(max(dot(perturbed_n, half_v), 0.0), 512.0);
+    let glint = vec3<f32>(1.0, 0.95, 0.88) * spec * 1.2;
+
+    // ── Compose: fresnel blends bottom vs sky ──
+    var color = mix(bottom_lit, sky, fresnel) + glint;
+
+    // Deep center gets a blue-green tint (volume of water)
+    let water_vol_tint = vec3<f32>(0.02, 0.06, 0.1) * depth;
+    color += water_vol_tint;
+
+    // ── Edge alpha ──
+    var alpha = 0.92;
+    if is_flat {
+        let pc = vec2<f32>(0.4, 0.2);
+        let ed = length(wp.xz - pc);
+        alpha = smoothstep(1.4, 1.2, ed); // fade at pond edge
+        alpha *= smoothstep(0.0, 0.1, depth); // fade at very shallow shore
+    }
 
     r.albedo = color;
-    r.emission = vec3(0.0);
+    r.emission = glint;
     r.metallic = 0.0;
-    r.roughness = 0.15;
-    r.alpha = 0.95;
+    r.roughness = 0.02;
+    r.alpha = alpha;
     r.normal = perturbed_n;
     r.is_emissive_only = false;
     return r;

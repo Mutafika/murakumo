@@ -69,14 +69,14 @@ const WATER: &[ParamSpec] = &[
 
 // ── 5: Fire ──
 const FIRE: &[ParamSpec] = &[
-    ps("Height",     0.4, 2.0, 1.0),
-    ps("Density",    0.3, 3.0, 1.0),
-    ps("Speed",      0.1, 3.0, 1.0),
-    ps("Heat",       0.5, 2.5, 1.0),
-    ps("Blue Core",  0.0, 1.0, 0.4),
-    ps("Brightness", 0.0, 3.0, 1.0),
-    ps("Hue",        0.0, 1.0, 0.083),  // 0.083 ≈ orange. 0=red, 0.16=yellow, 0.33=green, 0.5=cyan, 0.66=blue, 0.83=magenta
-    ps("White Hot",  0.0, 1.0, 0.6),    // how white the hottest tip becomes
+    ps("Height",     0.3, 3.0, 1.0),    // narrower → taller burner column
+    ps("Density",    0.3, 4.0, 1.0),
+    ps("Speed",      0.0, 10.0, 1.0),   // 0=frozen, ~5+ = burner jet
+    ps("Heat",       0.5, 3.0, 1.0),
+    ps("Blue Core",  0.0, 1.5, 0.4),
+    ps("Brightness", 0.0, 4.0, 1.0),
+    ps("Hue",        0.0, 1.0, 0.083),  // 0=red, 0.083=orange, 0.16=yellow, 0.33=green, 0.5=cyan, 0.66=blue, 0.83=magenta
+    ps("White Hot",  0.0, 1.0, 0.6),
 ];
 
 // ── 6: Smoke ──

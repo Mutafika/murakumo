@@ -1437,7 +1437,8 @@ impl SceneApp for GalleryApp {
         renderer.add_mesh("icosphere_huge", &procedural::icosphere(1.0, 5), None);
         renderer.add_mesh("rock_mesh", &procedural::rock(1.0, 4, 0.35, 42.0), None);
         renderer.add_mesh("terrain", &procedural::terrain(8.0, 64, 1.0), None);
-        renderer.add_mesh("water_surface", &procedural::water_plane(5.0, -0.1, 32), None);
+        // Water plane: oversized so shader alpha fade shapes it to pond
+        renderer.add_mesh("water_surface", &procedural::water_plane(6.0, 0.0, 32), None);
         renderer.add_mesh("torus", &procedural::torus(0.4, 0.15, 32, 16), None);
 
         // ── Custom PBR Material Pipeline (replaces prepass) ──
@@ -1714,12 +1715,12 @@ impl SceneApp for GalleryApp {
             // Field scene: draw water surface on top (transparent, uses Water material kind=4)
             if is_field {
                 if let Some(water_mesh) = renderer.get_mesh("water_surface") {
-                    // Build a temporary water instance and upload to an unused slot
-                    let water_model = Mat4::IDENTITY;
+                    // Position water at pond center, just below terrain rim
+                    let water_model = Mat4::from_translation(Vec3::new(0.4, -0.02, 0.2));
                     let water_inst = InstanceData {
                         model: water_model.to_cols_array_2d(),
                         color: [1.0, 1.0, 1.0, 1.0],
-                        material: [0.0, 0.15, 4.0, 1.0], // kind=4 (Water), flat=1
+                        material: [0.0, 0.15, 4.0, 0.0], // kind=4 (Water), flat=0 (real normal is fine)
                     };
                     // Write water instance to slot 0 (unused in field mode)
                     ctx.queue.write_buffer(
