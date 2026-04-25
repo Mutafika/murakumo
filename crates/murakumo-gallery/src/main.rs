@@ -1,26 +1,31 @@
 use glam::{Mat4, Vec3};
 use sabitori::*;
+use sabitori_widgets::SliderState;
 use seimei::procedural;
 use seimei::quality::{MsaaSamples, QualityPreset, QualitySettings, ShadowQuality};
 use seimei::{GpuVertex, InstanceData, Renderer};
 use web_time::Instant;
 use wgpu::util::DeviceExt;
 
+mod params;
+use params::{material_params, PARAMS_PER_MATERIAL};
+
 // ── Constants ──
 
-const MATERIAL_NAMES: [&str; 22] = [
+const MATERIAL_NAMES: [&str; 23] = [
     "Bubble", "Glass", "Portal", "Grid",
     "Water", "Fire", "Smoke", "Aurora",
     "Hologram", "Crystal", "Metal", "Neon",
     "Shield", "Dissolve", "Lightning", "Lava",
     "Ice", "Cloud", "Explosion", "Tornado",
-    "Skin", "Rock",
+    "Skin", "Rock", "Field",
 ];
 
-const MATERIAL_COUNT: usize = 22;
-const GRID_COLS: usize = 7;
-const GRID_ROWS: usize = 4;
+const MATERIAL_COUNT: usize = 23;
+const GRID_COLS: usize = 8;
+const GRID_ROWS: usize = 3;
 const SPACING: f32 = 1.8;
+const FIELD_INDEX: usize = 22;
 
 // ── Background camera uniform ──
 
@@ -43,6 +48,30 @@ struct PbrCameraUniform {
     position: [f32; 4], // xyz = eye, w = time
     clip_min: [f32; 4],
     clip_max: [f32; 4],
+}
+
+// ── Material params uniform (matches shader MatParamsUniform) ──
+//
+// Layout: 23 materials × 2 vec4 = 46 vec4 (= 184 floats / 736 bytes).
+
+const MAT_PARAMS_VEC4S: usize = MATERIAL_COUNT * 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatParamsUniform {
+    values: [[f32; 4]; MAT_PARAMS_VEC4S],
+}
+
+impl MatParamsUniform {
+    fn from_values(per_mat: &[[f32; PARAMS_PER_MATERIAL]; MATERIAL_COUNT]) -> Self {
+        let mut out = Self { values: [[0.0; 4]; MAT_PARAMS_VEC4S] };
+        for k in 0..MATERIAL_COUNT {
+            let p = &per_mat[k];
+            out.values[k * 2]     = [p[0], p[1], p[2], p[3]];
+            out.values[k * 2 + 1] = [p[4], p[5], p[6], p[7]];
+        }
+        out
+    }
 }
 
 // ── Background pass resources ──
@@ -189,6 +218,8 @@ struct PbrMaterialPass {
     // Group 3: Shadow
     shadow_bind_group: wgpu::BindGroup,
     shadow_light_vp_buffer: wgpu::Buffer,
+    // Per-material tunable parameters (Group 1, binding 1)
+    mat_params_buffer: wgpu::Buffer,
     // Instance buffer
     instance_buffer: wgpu::Buffer,
 }
@@ -243,26 +274,53 @@ impl PbrMaterialPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Material params buffer (binding 1 of group 1 — co-located with lights
+        // to stay within the default `max_bind_groups: 4` limit)
+        let mat_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pbr_mat_params_buffer"),
+            size: std::mem::size_of::<MatParamsUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let light_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pbr_light_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let light_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pbr_light_bg"),
             layout: &light_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: light_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: mat_params_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         // Group 2: Texture (1x1 white)
@@ -502,6 +560,7 @@ impl PbrMaterialPass {
             texture_bind_group: texture_bg,
             shadow_bind_group: shadow_bg,
             shadow_light_vp_buffer,
+            mat_params_buffer,
             instance_buffer,
         }
     }
@@ -592,6 +651,20 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Format a slider value for compact display (3 chars + sign + dot).
+fn format_value(v: f32) -> String {
+    let abs = v.abs();
+    if abs >= 100.0 {
+        format!("{:>5.0}", v)
+    } else if abs >= 10.0 {
+        format!("{:>5.1}", v)
+    } else if abs >= 1.0 {
+        format!("{:>5.2}", v)
+    } else {
+        format!("{:>5.3}", v)
+    }
+}
+
 fn mesh_id_for_material(mat_idx: usize) -> &'static str {
     match mat_idx {
         0 => "icosphere_hd",              // Bubble — high-poly for transparency
@@ -606,6 +679,7 @@ fn mesh_id_for_material(mat_idx: usize) -> &'static str {
         17 | 18 | 19 => "icosphere",      // Cloud, Explosion, Tornado — volumetric
         20 => "icosphere",                // Skin
         21 => "icosphere",                // Rock
+        22 => "icosphere",                // Field (placeholder for grid view)
         _ => "cube",
     }
 }
@@ -631,6 +705,7 @@ fn build_instance(mat_idx: usize, time: f32) -> InstanceData {
         16 => (Vec3::splat(0.55), 0.12, 0.05), // Ice
         20 => (Vec3::splat(0.55), 0.08, 0.0),  // Skin
         21 => (Vec3::splat(0.55), 0.06, 0.0),  // Rock
+        22 => (Vec3::splat(0.55), 0.05, 0.0),  // Field (thumbnail)
         // Cubes
         2 => (Vec3::splat(1.1), 0.35, 0.0),    // Portal
         3 => (Vec3::splat(1.0), 0.1, 0.4),     // Grid
@@ -680,6 +755,7 @@ fn build_instance(mat_idx: usize, time: f32) -> InstanceData {
         19 => (0.0, 0.7),  // Tornado
         20 => (0.0, 0.4),  // Skin
         21 => (0.0, 0.9),  // Rock
+        22 => (0.0, 0.8),  // Field
         _ => (0.0, 0.5),
     };
 
@@ -734,7 +810,27 @@ struct GalleryApp {
     grid_camera_pitch: f32,
     grid_camera_distance: f32,
     click_pos: (f32, f32),
+    // Per-material tunable params + slider widgets (one per material × param)
+    material_param_values: Vec<[f32; PARAMS_PER_MATERIAL]>,
+    material_sliders: Vec<Vec<SliderState>>,
+    /// (material_idx, param_idx) currently being dragged
+    dragging_slider: Option<(usize, usize)>,
 }
+
+// ── Parameter drawer layout (detail mode) ──
+
+const DRAWER_W: f32 = 280.0;
+const DRAWER_RIGHT_MARGIN: f32 = 12.0;
+const DRAWER_TOP: f32 = 64.0;
+const DRAWER_PAD: f32 = 14.0;
+const SLIDER_LABEL_W: f32 = 78.0;
+const SLIDER_TRACK_W: f32 = 130.0;
+const SLIDER_VALUE_W: f32 = 48.0;
+const SLIDER_GAP: f32 = 8.0;
+const SLIDER_ROW_H: f32 = 24.0;
+const SLIDER_ROW_STRIDE: f32 = 30.0;
+const DRAWER_TITLE_H: f32 = 24.0;
+const DRAWER_TITLE_GAP: f32 = 10.0;
 
 /// Returns true if this material should be shown as a landscape (huge sphere = ground)
 fn is_landscape_material(index: usize) -> bool {
@@ -744,7 +840,8 @@ fn is_landscape_material(index: usize) -> bool {
 /// Mesh to use in detail view
 fn detail_mesh_id(index: usize) -> &'static str {
     match index {
-        15 | 21 => "rock_mesh",  // Lava, Rock — irregular rock geometry
+        15 | 21 => "rock_mesh",
+        FIELD_INDEX => "terrain",  // Field: terrain mesh (water drawn separately)
         _ if is_landscape_material(index) => "icosphere_huge",
         _ => mesh_id_for_material(index),
     }
@@ -762,8 +859,10 @@ fn detail_scale(index: usize) -> Vec3 {
         18 => Vec3::new(2.5, 2.5, 2.5),   // Explosion
         19 => Vec3::new(1.5, 3.5, 1.5),   // Tornado
         14 => Vec3::new(2.0, 3.0, 2.0),   // Lightning — tall volumetric column
+        // Field: terrain already sized at 8.0, just scale 1:1
+        FIELD_INDEX => Vec3::splat(1.0),
         // Surface materials: large sphere to fill view
-        10 | 15 | 16 | 20 | 21 => Vec3::splat(2.0), // Metal, Lava, Ice, Skin, Rock
+        10 | 15 | 16 | 20 | 21 => Vec3::splat(2.0),
         // Natural shapes
         0 | 1 | 9 | 12 => Vec3::splat(1.5), // Bubble, Glass, Crystal, Shield
         2 => Vec3::splat(2.0),             // Portal
@@ -775,7 +874,8 @@ fn detail_scale(index: usize) -> Vec3 {
 
 fn detail_camera_distance(index: usize) -> f32 {
     match index {
-        _ if is_landscape_material(index) => 2.5, // Close to surface, looking across
+        FIELD_INDEX => 6.0,
+        _ if is_landscape_material(index) => 2.5,
         5 | 6 | 14 | 19 => 6.0,
         17 | 18 => 6.0,
         _ => 4.0,
@@ -783,8 +883,10 @@ fn detail_camera_distance(index: usize) -> f32 {
 }
 
 fn detail_camera_pitch(index: usize) -> f32 {
-    if is_landscape_material(index) {
-        0.15 // Low angle — looking across the surface toward horizon
+    if index == FIELD_INDEX {
+        0.5 // Look down at the field
+    } else if is_landscape_material(index) {
+        0.15
     } else {
         0.25
     }
@@ -820,6 +922,20 @@ fn detail_y_offset(index: usize) -> f32 {
 
 impl GalleryApp {
     fn new() -> Self {
+        let mut material_param_values = Vec::with_capacity(MATERIAL_COUNT);
+        let mut material_sliders = Vec::with_capacity(MATERIAL_COUNT);
+        for k in 0..MATERIAL_COUNT {
+            let defaults = params::default_values(k);
+            material_param_values.push(defaults);
+            let specs = material_params(k);
+            let sliders: Vec<SliderState> = specs
+                .iter()
+                .enumerate()
+                .map(|(i, spec)| SliderState::from_ranged(defaults[i], spec.min, spec.max))
+                .collect();
+            material_sliders.push(sliders);
+        }
+
         Self {
             camera: OrbitCamera::new(),
             renderer: None,
@@ -835,7 +951,71 @@ impl GalleryApp {
             grid_camera_pitch: 0.3,
             grid_camera_distance: 8.0,
             click_pos: (0.0, 0.0),
+            material_param_values,
+            material_sliders,
+            dragging_slider: None,
         }
+    }
+
+    /// Material being shown in the param drawer (only when fully in detail).
+    fn drawer_material(&self) -> Option<usize> {
+        match &self.state {
+            GalleryState::Detail { index } => Some(*index),
+            _ => None,
+        }
+    }
+
+    /// Storage slot whose params actually drive rendering for `material_idx`.
+    /// Most materials map to themselves; Field reuses Rock's slot since the
+    /// gallery renders the field terrain with the Rock material kind.
+    fn storage_index(material_idx: usize) -> usize {
+        if material_idx == FIELD_INDEX { 21 } else { material_idx }
+    }
+
+    /// Track screen-space `Rect` for the i-th param of the active material.
+    /// Returns `(track_x, track_y, track_w, track_h)`.
+    fn slider_track_xywh(&self, param_idx: usize) -> (f32, f32, f32, f32) {
+        let drawer_x = self.width - DRAWER_W - DRAWER_RIGHT_MARGIN;
+        let track_x = drawer_x + DRAWER_PAD + SLIDER_LABEL_W + SLIDER_GAP;
+        let row_top = DRAWER_TOP + DRAWER_PAD + DRAWER_TITLE_H + DRAWER_TITLE_GAP
+            + (param_idx as f32) * SLIDER_ROW_STRIDE;
+        // Track itself is centered vertically inside the 24px row, but we treat
+        // the whole row band as the hit zone for ergonomics.
+        (track_x, row_top, SLIDER_TRACK_W, SLIDER_ROW_H)
+    }
+
+    /// Hit-test the entire drawer row band (not just the visible 4px track),
+    /// matching what the user sees as a clickable line.
+    fn slider_hit_test(&self, mat_idx: usize, mouse: (f32, f32)) -> Option<usize> {
+        let n = material_params(mat_idx).len();
+        if n == 0 {
+            return None;
+        }
+        let drawer_x = self.width - DRAWER_W - DRAWER_RIGHT_MARGIN;
+        let row_left = drawer_x + DRAWER_PAD + SLIDER_LABEL_W + SLIDER_GAP;
+        let row_w = SLIDER_TRACK_W + SLIDER_GAP + SLIDER_VALUE_W;
+        for i in 0..n {
+            let (_, ty, _, _) = self.slider_track_xywh(i);
+            if mouse.0 >= row_left
+                && mouse.0 <= row_left + row_w
+                && mouse.1 >= ty
+                && mouse.1 <= ty + SLIDER_ROW_H
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Apply the slider's normalized value back to the per-material float array.
+    fn sync_value_from_slider(&mut self, mat_idx: usize, param_idx: usize) {
+        let spec = match material_params(mat_idx).get(param_idx) {
+            Some(s) => *s,
+            None => return,
+        };
+        let storage = Self::storage_index(mat_idx);
+        let v = self.material_sliders[storage][param_idx].ranged(spec.min, spec.max);
+        self.material_param_values[storage][param_idx] = v;
     }
 
     /// Hit-test: find which material grid cell was clicked
@@ -987,6 +1167,80 @@ impl DeclarativeApp for GalleryApp {
                 .font_size(12.0)
                 .color(Color::new(0.4, 0.4, 0.5, 0.5));
             children.push(div().pos(20.0, ctx.height - 24.0).child(esc));
+
+            // ── Param drawer (right side) ──
+            // Shown for any material that has tunable params, both during and
+            // after the transition (so it pops in alongside the detail UI).
+            let specs = material_params(idx);
+            if !specs.is_empty() {
+                let drawer_x = ctx.width - DRAWER_W - DRAWER_RIGHT_MARGIN;
+                let drawer_h = DRAWER_PAD * 2.0
+                    + DRAWER_TITLE_H
+                    + DRAWER_TITLE_GAP
+                    + (specs.len() as f32) * SLIDER_ROW_STRIDE
+                    - (SLIDER_ROW_STRIDE - SLIDER_ROW_H);
+
+                // Background panel
+                children.push(
+                    div()
+                        .pos(drawer_x, DRAWER_TOP)
+                        .w(Px(DRAWER_W))
+                        .h(Px(drawer_h))
+                        .bg(Color::new(0.04, 0.05, 0.09, 0.85))
+                        .border(1.0, Color::new(0.4, 0.5, 0.7, 0.4))
+                        .rounded_px(8.0),
+                );
+
+                // Title
+                children.push(
+                    div()
+                        .pos(drawer_x + DRAWER_PAD, DRAWER_TOP + DRAWER_PAD)
+                        .w(Px(DRAWER_W - DRAWER_PAD * 2.0))
+                        .h(Px(DRAWER_TITLE_H))
+                        .child(
+                            text("PARAMETERS".to_string())
+                                .mono()
+                                .bold()
+                                .font_size(13.0)
+                                .color(Color::new(0.7, 0.8, 1.0, 0.9)),
+                        ),
+                );
+
+                // Sliders
+                let track_color = Color::new(0.2, 0.25, 0.35, 0.85);
+                let fill_color = Color::new(0.55, 0.75, 1.0, 1.0);
+                let knob_color = Color::new(0.9, 0.95, 1.0, 1.0);
+                let text_color = Color::new(0.78, 0.85, 0.95, 0.95);
+                let storage = Self::storage_index(idx);
+                for (i, spec) in specs.iter().enumerate() {
+                    let row_y = DRAWER_TOP + DRAWER_PAD + DRAWER_TITLE_H + DRAWER_TITLE_GAP
+                        + (i as f32) * SLIDER_ROW_STRIDE;
+                    let value = self.material_param_values[storage][i];
+                    let norm = self.material_sliders[storage][i].value();
+                    let id = format!("slider-{}-{}", idx, i);
+                    let row_w = SLIDER_LABEL_W + SLIDER_TRACK_W + SLIDER_VALUE_W + SLIDER_GAP * 2.0;
+                    let row = labeled_slider(
+                        &id,
+                        spec.name,
+                        &format_value(value),
+                        norm,
+                        SLIDER_LABEL_W,
+                        SLIDER_TRACK_W,
+                        SLIDER_VALUE_W,
+                        text_color,
+                        track_color,
+                        fill_color,
+                        knob_color,
+                    );
+                    children.push(
+                        div()
+                            .pos(drawer_x + DRAWER_PAD, row_y)
+                            .w(Px(row_w))
+                            .h(Px(SLIDER_ROW_H))
+                            .child(row),
+                    );
+                }
+            }
         } else {
             // ── Grid mode UI ──
             let title = text("MURAKUMO \u{2014} Material Gallery".to_string())
@@ -1055,6 +1309,20 @@ impl DeclarativeApp for GalleryApp {
         match event {
             InputEvent::PointerPressed { position, button } => {
                 if *button == MouseButton::Left {
+                    // Slider hit (drawer takes priority over orbit camera)
+                    if let Some(mat_idx) = self.drawer_material() {
+                        if let Some(param_idx) =
+                            self.slider_hit_test(mat_idx, (position.x, position.y))
+                        {
+                            let (tx, _, tw, _) = self.slider_track_xywh(param_idx);
+                            let storage = Self::storage_index(mat_idx);
+                            self.material_sliders[storage][param_idx]
+                                .begin_drag(position.x, tx, tw);
+                            self.sync_value_from_slider(mat_idx, param_idx);
+                            self.dragging_slider = Some((mat_idx, param_idx));
+                            return true;
+                        }
+                    }
                     self.drag_distance = 0.0;
                     self.click_pos = (position.x, position.y);
                     self.camera.on_drag_start(position.x, position.y);
@@ -1063,6 +1331,11 @@ impl DeclarativeApp for GalleryApp {
             }
             InputEvent::PointerReleased { position, button } => {
                 if *button == MouseButton::Left {
+                    if let Some((mat_idx, param_idx)) = self.dragging_slider.take() {
+                        let storage = Self::storage_index(mat_idx);
+                        self.material_sliders[storage][param_idx].end_drag();
+                        return true;
+                    }
                     self.camera.on_drag_end();
                     // Click detection: if drag was very short, treat as click
                     if self.drag_distance < 5.0 {
@@ -1098,6 +1371,13 @@ impl DeclarativeApp for GalleryApp {
     }
 
     fn on_pointer_move(&mut self, x: f32, y: f32) {
+        if let Some((mat_idx, param_idx)) = self.dragging_slider {
+            let (tx, _, tw, _) = self.slider_track_xywh(param_idx);
+            let storage = Self::storage_index(mat_idx);
+            self.material_sliders[storage][param_idx].drag_to(x, tx, tw);
+            self.sync_value_from_slider(mat_idx, param_idx);
+            return;
+        }
         if self.camera.dragging {
             let dx = x - self.camera.last_mouse.0;
             let dy = y - self.camera.last_mouse.1;
@@ -1156,6 +1436,8 @@ impl SceneApp for GalleryApp {
         renderer.add_mesh("plane", &procedural::plane(1.0, 1.0, 8, 8), None);
         renderer.add_mesh("icosphere_huge", &procedural::icosphere(1.0, 5), None);
         renderer.add_mesh("rock_mesh", &procedural::rock(1.0, 4, 0.35, 42.0), None);
+        renderer.add_mesh("terrain", &procedural::terrain(8.0, 64, 1.0), None);
+        renderer.add_mesh("water_surface", &procedural::water_plane(5.0, -0.1, 32), None);
         renderer.add_mesh("torus", &procedural::torus(0.4, 0.15, 32, 16), None);
 
         // ── Custom PBR Material Pipeline (replaces prepass) ──
@@ -1273,6 +1555,19 @@ impl SceneApp for GalleryApp {
             bytemuck::bytes_of(&pbr_cam),
         );
 
+        // Update material params uniform (all 23 materials, current values)
+        let mut params_arr: [[f32; PARAMS_PER_MATERIAL]; MATERIAL_COUNT] =
+            [[0.0; PARAMS_PER_MATERIAL]; MATERIAL_COUNT];
+        for k in 0..MATERIAL_COUNT {
+            params_arr[k] = self.material_param_values[k];
+        }
+        let mat_params = MatParamsUniform::from_values(&params_arr);
+        ctx.queue.write_buffer(
+            &pbr_pass.mat_params_buffer,
+            0,
+            bytemuck::bytes_of(&mat_params),
+        );
+
         // Determine which materials to draw and how
         let detail_index = match &self.state {
             GalleryState::Detail { index } => Some(*index),
@@ -1284,40 +1579,47 @@ impl SceneApp for GalleryApp {
         let instance_size = std::mem::size_of::<InstanceData>();
         let mut instance_data = Vec::with_capacity(MATERIAL_COUNT * instance_size);
 
+        // For Field scene: we need an extra instance for water
+        let is_field = detail_index == Some(FIELD_INDEX);
+
         if let Some(idx) = detail_index {
-            // Detail mode: single material at world center, large scale
-            let use_detail_mesh = is_landscape_material(idx);
+            // Detail mode
             for i in 0..MATERIAL_COUNT {
                 if i == idx {
                     let scale = detail_scale(idx);
                     let y_off = detail_y_offset(idx);
-                    let rot_speed = if use_detail_mesh { 0.0 } else { 0.1 }; // No rotation for flat surfaces
-                    let yaw = self.time * rot_speed;
+                    let is_static = is_landscape_material(idx) || idx == FIELD_INDEX;
+                    let yaw = if is_static { 0.0 } else { self.time * 0.1 };
                     let model = Mat4::from_translation(Vec3::new(0.0, y_off, 0.0))
                         * Mat4::from_rotation_y(yaw)
                         * Mat4::from_scale(scale);
                     let cols = model.to_cols_array_2d();
-                    let (metallic, roughness) = match idx {
-                        0 => (0.0, 0.1), 1 => (0.1, 0.05), 2 => (0.0, 0.3),
-                        3 => (0.3, 0.5), 4 => (0.0, 0.15), 5 => (0.0, 0.8),
-                        6 => (0.0, 0.9), 7 => (0.0, 0.4), 8 => (0.5, 0.2),
-                        9 => (0.2, 0.1), 10 => (1.0, 0.3), 11 => (0.0, 0.1),
-                        12 => (0.3, 0.2), 13 => (0.0, 0.4), 14 => (0.0, 0.5),
-                        15 => (0.0, 0.8), 16 => (0.1, 0.15), 17 => (0.0, 0.9),
-                        18 => (0.0, 0.8), 19 => (0.0, 0.7), 20 => (0.0, 0.4),
-                        21 => (0.0, 0.9),
-                        _ => (0.0, 0.5),
+
+                    // Field uses Rock material (kind=21) for terrain
+                    let mat_kind = if idx == FIELD_INDEX { 21.0 } else { idx as f32 };
+                    let (metallic, roughness) = if idx == FIELD_INDEX {
+                        (0.0, 0.9)
+                    } else {
+                        match idx {
+                            0 => (0.0, 0.1), 1 => (0.1, 0.05), 2 => (0.0, 0.3),
+                            3 => (0.3, 0.5), 4 => (0.0, 0.15), 5 => (0.0, 0.8),
+                            6 => (0.0, 0.9), 7 => (0.0, 0.4), 8 => (0.5, 0.2),
+                            9 => (0.2, 0.1), 10 => (1.0, 0.3), 11 => (0.0, 0.1),
+                            12 => (0.3, 0.2), 13 => (0.0, 0.4), 14 => (0.0, 0.5),
+                            15 => (0.0, 0.8), 16 => (0.1, 0.15), 17 => (0.0, 0.9),
+                            18 => (0.0, 0.8), 19 => (0.0, 0.7), 20 => (0.0, 0.4),
+                            21 => (0.0, 0.9),
+                            _ => (0.0, 0.5),
+                        }
                     };
-                    // material.w = 1.0 signals "flat surface mode" to shader (use wp instead of n)
-                    let flat_flag = if use_detail_mesh { 1.0 } else { 0.0 };
+                    let flat_flag = if is_landscape_material(idx) || idx == FIELD_INDEX { 1.0 } else { 0.0 };
                     let inst = InstanceData {
                         model: cols,
                         color: [1.0, 1.0, 1.0, 1.0],
-                        material: [metallic, roughness, idx as f32, flat_flag],
+                        material: [metallic, roughness, mat_kind, flat_flag],
                     };
                     instance_data.extend_from_slice(bytemuck::bytes_of(&inst));
                 } else {
-                    // Zero-scale dummy for unused slots
                     let inst = InstanceData {
                         model: [[0.0; 4]; 4],
                         color: [0.0; 4],
@@ -1406,6 +1708,29 @@ impl SceneApp for GalleryApp {
                     pass.set_vertex_buffer(1, pbr_pass.instance_buffer.slice(offset..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                }
+            }
+
+            // Field scene: draw water surface on top (transparent, uses Water material kind=4)
+            if is_field {
+                if let Some(water_mesh) = renderer.get_mesh("water_surface") {
+                    // Build a temporary water instance and upload to an unused slot
+                    let water_model = Mat4::IDENTITY;
+                    let water_inst = InstanceData {
+                        model: water_model.to_cols_array_2d(),
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        material: [0.0, 0.15, 4.0, 1.0], // kind=4 (Water), flat=1
+                    };
+                    // Write water instance to slot 0 (unused in field mode)
+                    ctx.queue.write_buffer(
+                        &pbr_pass.instance_buffer,
+                        0,
+                        bytemuck::bytes_of(&water_inst),
+                    );
+                    pass.set_vertex_buffer(0, water_mesh.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, pbr_pass.instance_buffer.slice(..));
+                    pass.set_index_buffer(water_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..water_mesh.index_count, 0, 0..1);
                 }
             }
         }
