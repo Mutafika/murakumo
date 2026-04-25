@@ -8,15 +8,17 @@ use wgpu::util::DeviceExt;
 
 // ── Constants ──
 
-const MATERIAL_NAMES: [&str; 16] = [
+const MATERIAL_NAMES: [&str; 22] = [
     "Bubble", "Glass", "Portal", "Grid",
     "Water", "Fire", "Smoke", "Aurora",
     "Hologram", "Crystal", "Metal", "Neon",
-    "Shield", "Warp", "Dissolve", "Lightning",
+    "Shield", "Dissolve", "Lightning", "Lava",
+    "Ice", "Cloud", "Explosion", "Tornado",
+    "Skin", "Rock",
 ];
 
-const MATERIAL_COUNT: usize = 16;
-const GRID_COLS: usize = 4;
+const MATERIAL_COUNT: usize = 22;
+const GRID_COLS: usize = 7;
 const GRID_ROWS: usize = 4;
 const SPACING: f32 = 1.8;
 
@@ -175,6 +177,7 @@ impl BackgroundPass {
 
 struct PbrMaterialPass {
     pipeline: wgpu::RenderPipeline,
+    transparent_pipeline: wgpu::RenderPipeline, // No depth write for transparent materials
     // Group 0: Camera (with time in position.w)
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -188,6 +191,11 @@ struct PbrMaterialPass {
     shadow_light_vp_buffer: wgpu::Buffer,
     // Instance buffer
     instance_buffer: wgpu::Buffer,
+}
+
+fn is_transparent_material(index: usize) -> bool {
+    // Bubble, Glass, Fire, Smoke, Lightning, Cloud, Explosion, Tornado
+    matches!(index, 0 | 1 | 5 | 6 | 14 | 17 | 18 | 19)
 }
 
 impl PbrMaterialPass {
@@ -408,6 +416,7 @@ impl PbrMaterialPass {
             mapped_at_creation: false,
         });
 
+        // Opaque pipeline: depth write ON, backface culling ON
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("pbr_material_pipeline"),
             layout: Some(&pipeline_layout),
@@ -430,7 +439,7 @@ impl PbrMaterialPass {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None, // No culling for transparency
+                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -445,8 +454,47 @@ impl PbrMaterialPass {
             cache: None,
         });
 
+        // Transparent pipeline: NO depth write, NO backface cull
+        let transparent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pbr_transparent_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[GpuVertex::layout(), InstanceData::layout()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back), // Cull back — shader simulates both surfaces
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false, // Don't write depth — back faces must be visible
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
+            transparent_pipeline,
             camera_buffer,
             camera_bind_group: camera_bg,
             light_buffer,
@@ -540,13 +588,24 @@ impl OrbitCamera {
 
 // ── Helpers ──
 
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 fn mesh_id_for_material(mat_idx: usize) -> &'static str {
     match mat_idx {
-        0 | 1 | 4 | 9 | 10 | 12 => "icosphere",
-        2 | 3 | 8 | 13 | 14 => "cube",
-        5 | 6 => "cylinder",
-        7 | 15 => "plane",
-        11 => "torus",
+        0 => "icosphere_hd",              // Bubble — high-poly for transparency
+        1 | 4 | 9 | 10 | 12 => "icosphere", // Glass, Water, Crystal, Metal, Shield
+        2 | 3 | 8 | 13 => "cube",         // Portal, Grid, Hologram, Dissolve
+        5 | 6 => "icosphere",             // Fire, Smoke — volumetric ray march
+        7 => "plane",                      // Aurora
+        11 => "torus",                     // Neon
+        14 => "icosphere",                // Lightning — volumetric arcs
+        15 => "icosphere",                // Lava
+        16 => "icosphere",                // Ice
+        17 | 18 | 19 => "icosphere",      // Cloud, Explosion, Tornado — volumetric
+        20 => "icosphere",                // Skin
+        21 => "icosphere",                // Rock
         _ => "cube",
     }
 }
@@ -561,22 +620,32 @@ fn build_instance(mat_idx: usize, time: f32) -> InstanceData {
     let bob = (time * 1.0 + mat_idx as f32 * 0.4).sin() * 0.04;
 
     let (scale, rot_speed, tilt) = match mat_idx {
-        0 => (Vec3::splat(0.55), 0.15, 0.0),
-        1 => (Vec3::splat(0.55), 0.12, 0.0),
-        9 => (Vec3::splat(0.55), 0.18, 0.1),
-        10 => (Vec3::splat(0.55), 0.1, 0.0),
-        12 => (Vec3::splat(0.55), 0.15, 0.05),
-        4 => (Vec3::splat(0.55), 0.1, 0.0),
-        2 => (Vec3::splat(1.1), 0.35, 0.0),
-        3 => (Vec3::splat(1.0), 0.1, 0.4),
-        8 => (Vec3::splat(1.0), 0.4, 0.05),
-        13 => (Vec3::splat(1.0), 0.3, 0.1),
-        14 => (Vec3::splat(1.0), 0.2, 0.0),
-        5 => (Vec3::new(1.5, 2.2, 1.5), 0.05, 0.0),
-        6 => (Vec3::new(1.4, 1.8, 1.4), 0.03, 0.0),
-        7 => (Vec3::new(1.3, 1.0, 1.3), 0.08, 0.3),
-        15 => (Vec3::new(1.1, 1.0, 1.1), 0.05, 0.2),
-        11 => (Vec3::splat(1.8), 0.2, 0.0),
+        // Spheres (natural/physical)
+        0 => (Vec3::splat(0.55), 0.15, 0.0),   // Bubble
+        1 => (Vec3::splat(0.55), 0.12, 0.0),   // Glass
+        4 => (Vec3::splat(0.55), 0.1, 0.0),    // Water
+        9 => (Vec3::splat(0.55), 0.18, 0.1),   // Crystal
+        10 => (Vec3::splat(0.55), 0.1, 0.0),   // Metal
+        12 => (Vec3::splat(0.55), 0.15, 0.05), // Shield
+        15 => (Vec3::splat(0.55), 0.1, 0.0),   // Lava
+        16 => (Vec3::splat(0.55), 0.12, 0.05), // Ice
+        20 => (Vec3::splat(0.55), 0.08, 0.0),  // Skin
+        21 => (Vec3::splat(0.55), 0.06, 0.0),  // Rock
+        // Cubes
+        2 => (Vec3::splat(1.1), 0.35, 0.0),    // Portal
+        3 => (Vec3::splat(1.0), 0.1, 0.4),     // Grid
+        8 => (Vec3::splat(1.0), 0.4, 0.05),    // Hologram
+        13 => (Vec3::splat(1.0), 0.3, 0.1),    // Dissolve
+        // Volumetric spheres
+        5 => (Vec3::splat(0.7), 0.05, 0.0),    // Fire
+        6 => (Vec3::splat(0.7), 0.03, 0.0),    // Smoke
+        17 => (Vec3::splat(0.7), 0.02, 0.0),   // Cloud
+        18 => (Vec3::splat(0.7), 0.0, 0.0),    // Explosion
+        19 => (Vec3::splat(0.7), 0.0, 0.0),    // Tornado
+        // Flat/special
+        7 => (Vec3::new(1.3, 1.0, 1.3), 0.08, 0.3),  // Aurora
+        14 => (Vec3::splat(0.65), 0.0, 0.0),    // Lightning — volumetric sphere
+        11 => (Vec3::splat(1.8), 0.2, 0.0),    // Neon
         _ => (Vec3::splat(1.0), 0.2, 0.0),
     };
 
@@ -589,22 +658,28 @@ fn build_instance(mat_idx: usize, time: f32) -> InstanceData {
     let cols = model.to_cols_array_2d();
 
     let (metallic, roughness) = match mat_idx {
-        0 => (0.0, 0.1),
-        1 => (0.1, 0.05),
-        2 => (0.0, 0.3),
-        3 => (0.3, 0.5),
-        4 => (0.0, 0.15),
-        5 => (0.0, 0.8),
-        6 => (0.0, 0.9),
-        7 => (0.0, 0.4),
-        8 => (0.5, 0.2),
-        9 => (0.2, 0.1),
-        10 => (1.0, 0.3),
-        11 => (0.0, 0.1),
-        12 => (0.3, 0.2),
-        13 => (0.0, 0.4),
-        14 => (0.0, 0.5),
-        15 => (0.0, 0.3),
+        0 => (0.0, 0.1),   // Bubble
+        1 => (0.1, 0.05),  // Glass
+        2 => (0.0, 0.3),   // Portal
+        3 => (0.3, 0.5),   // Grid
+        4 => (0.0, 0.15),  // Water
+        5 => (0.0, 0.8),   // Fire
+        6 => (0.0, 0.9),   // Smoke
+        7 => (0.0, 0.4),   // Aurora
+        8 => (0.5, 0.2),   // Hologram
+        9 => (0.2, 0.1),   // Crystal
+        10 => (1.0, 0.3),  // Metal
+        11 => (0.0, 0.1),  // Neon
+        12 => (0.3, 0.2),  // Shield
+        13 => (0.0, 0.4),  // Dissolve
+        14 => (0.0, 0.5),  // Lightning
+        15 => (0.0, 0.8),  // Lava
+        16 => (0.1, 0.15), // Ice
+        17 => (0.0, 0.9),  // Cloud
+        18 => (0.0, 0.8),  // Explosion
+        19 => (0.0, 0.7),  // Tornado
+        20 => (0.0, 0.4),  // Skin
+        21 => (0.0, 0.9),  // Rock
         _ => (0.0, 0.5),
     };
 
@@ -635,6 +710,14 @@ struct LightUniformData {
 
 // ── Gallery App ──
 
+#[derive(Clone)]
+enum GalleryState {
+    Grid,
+    TransitionToDetail { index: usize, progress: f32 },
+    Detail { index: usize },
+    TransitionToGrid { from_index: usize, progress: f32 },
+}
+
 struct GalleryApp {
     camera: OrbitCamera,
     renderer: Option<Renderer>,
@@ -645,6 +728,94 @@ struct GalleryApp {
     width: f32,
     height: f32,
     drag_distance: f32,
+    state: GalleryState,
+    // Saved grid camera for transitions
+    grid_camera_yaw: f32,
+    grid_camera_pitch: f32,
+    grid_camera_distance: f32,
+    click_pos: (f32, f32),
+}
+
+/// Returns true if this material should be shown as a landscape (huge sphere = ground)
+fn is_landscape_material(index: usize) -> bool {
+    matches!(index, 4) // Water only — flat surface works for water
+}
+
+/// Mesh to use in detail view
+fn detail_mesh_id(index: usize) -> &'static str {
+    match index {
+        15 | 21 => "rock_mesh",  // Lava, Rock — irregular rock geometry
+        _ if is_landscape_material(index) => "icosphere_huge",
+        _ => mesh_id_for_material(index),
+    }
+}
+
+/// Per-material detail view settings
+fn detail_scale(index: usize) -> Vec3 {
+    match index {
+        // Landscape: huge sphere below camera
+        _ if is_landscape_material(index) => Vec3::splat(20.0),
+        // Volumetric: large bounding spheres
+        5 => Vec3::new(2.0, 3.0, 2.0),    // Fire
+        6 => Vec3::new(2.5, 3.0, 2.5),    // Smoke
+        17 => Vec3::new(3.0, 2.0, 3.0),   // Cloud
+        18 => Vec3::new(2.5, 2.5, 2.5),   // Explosion
+        19 => Vec3::new(1.5, 3.5, 1.5),   // Tornado
+        14 => Vec3::new(2.0, 3.0, 2.0),   // Lightning — tall volumetric column
+        // Surface materials: large sphere to fill view
+        10 | 15 | 16 | 20 | 21 => Vec3::splat(2.0), // Metal, Lava, Ice, Skin, Rock
+        // Natural shapes
+        0 | 1 | 9 | 12 => Vec3::splat(1.5), // Bubble, Glass, Crystal, Shield
+        2 => Vec3::splat(2.0),             // Portal
+        8 => Vec3::splat(2.0),             // Hologram
+        11 => Vec3::splat(2.5),            // Neon
+        _ => Vec3::splat(2.0),
+    }
+}
+
+fn detail_camera_distance(index: usize) -> f32 {
+    match index {
+        _ if is_landscape_material(index) => 2.5, // Close to surface, looking across
+        5 | 6 | 14 | 19 => 6.0,
+        17 | 18 => 6.0,
+        _ => 4.0,
+    }
+}
+
+fn detail_camera_pitch(index: usize) -> f32 {
+    if is_landscape_material(index) {
+        0.15 // Low angle — looking across the surface toward horizon
+    } else {
+        0.25
+    }
+}
+
+/// Where the camera looks at (orbit target)
+fn detail_camera_target(index: usize) -> f32 {
+    if is_landscape_material(index) {
+        0.3 // Look at a point slightly above the ground surface
+    } else {
+        match index {
+            5 => 0.5,   // Fire: look at flame center
+            19 => 0.5,  // Tornado
+            18 => 0.5,  // Explosion
+            _ => 0.0,
+        }
+    }
+}
+
+/// Where the mesh center is placed (Y offset)
+fn detail_y_offset(index: usize) -> f32 {
+    if is_landscape_material(index) {
+        -20.0 // Sphere center far below — top of sphere is at Y=0
+    } else {
+        match index {
+            5 => -0.5,
+            19 => 0.5,
+            18 => 0.5,
+            _ => 0.0,
+        }
+    }
 }
 
 impl GalleryApp {
@@ -659,6 +830,54 @@ impl GalleryApp {
             width: 960.0,
             height: 640.0,
             drag_distance: 0.0,
+            state: GalleryState::Grid,
+            grid_camera_yaw: 0.0,
+            grid_camera_pitch: 0.3,
+            grid_camera_distance: 8.0,
+            click_pos: (0.0, 0.0),
+        }
+    }
+
+    /// Hit-test: find which material grid cell was clicked
+    fn hit_test_grid(&self, screen_x: f32, screen_y: f32) -> Option<usize> {
+        let vp = self.camera.view_proj();
+        let mut best: Option<(usize, f32)> = None;
+
+        for i in 0..MATERIAL_COUNT {
+            let col = i % GRID_COLS;
+            let row = i / GRID_COLS;
+            let x = (col as f32 - (GRID_COLS as f32 - 1.0) * 0.5) * SPACING;
+            let y = ((GRID_ROWS - 1 - row) as f32 - (GRID_ROWS as f32 - 1.0) * 0.5) * SPACING;
+
+            let world = glam::Vec4::new(x, y, 0.0, 1.0);
+            let clip = vp * world;
+            if clip.w <= 0.0 { continue; }
+            let ndc = clip.truncate() / clip.w;
+            let sx = (ndc.x * 0.5 + 0.5) * self.width;
+            let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * self.height;
+
+            let dist = ((screen_x - sx).powi(2) + (screen_y - sy).powi(2)).sqrt();
+            let hit_radius = 50.0; // pixels
+            if dist < hit_radius {
+                if best.is_none() || dist < best.unwrap().1 {
+                    best = Some((i, dist));
+                }
+            }
+        }
+
+        best.map(|(i, _)| i)
+    }
+
+    fn enter_detail(&mut self, index: usize) {
+        self.grid_camera_yaw = self.camera.yaw;
+        self.grid_camera_pitch = self.camera.pitch;
+        self.grid_camera_distance = self.camera.distance;
+        self.state = GalleryState::TransitionToDetail { index, progress: 0.0 };
+    }
+
+    fn enter_grid(&mut self) {
+        if let GalleryState::Detail { index } = self.state {
+            self.state = GalleryState::TransitionToGrid { from_index: index, progress: 0.0 };
         }
     }
 }
@@ -680,72 +899,151 @@ impl DeclarativeApp for GalleryApp {
         ]
     }
 
-    fn tick(&mut self, _dt: f32) {
+    fn tick(&mut self, dt: f32) {
         self.time = self.start.elapsed().as_secs_f32();
+
+        // Animate state transitions
+        let transition_speed = 3.0; // ~0.33 seconds
+        let new_state = match &self.state {
+            GalleryState::TransitionToDetail { index, progress } => {
+                let p = (progress + dt * transition_speed).min(1.0);
+                let ease = p * p * (3.0 - 2.0 * p); // smoothstep
+
+                // Interpolate camera toward detail view
+                let target_dist = detail_camera_distance(*index);
+                self.camera.distance = lerp(self.grid_camera_distance, target_dist, ease);
+                self.camera.pitch = lerp(self.grid_camera_pitch, detail_camera_pitch(*index), ease);
+                let cam_target_y = detail_camera_target(*index);
+                self.camera.target = Vec3::new(0.0, cam_target_y * ease, 0.0);
+
+                if p >= 1.0 {
+                    Some(GalleryState::Detail { index: *index })
+                } else {
+                    Some(GalleryState::TransitionToDetail { index: *index, progress: p })
+                }
+            }
+            GalleryState::TransitionToGrid { from_index, progress } => {
+                let p = (progress + dt * transition_speed).min(1.0);
+                let ease = p * p * (3.0 - 2.0 * p);
+
+                let from_dist = detail_camera_distance(*from_index);
+                self.camera.distance = lerp(from_dist, self.grid_camera_distance, ease);
+                self.camera.pitch = lerp(detail_camera_pitch(*from_index), self.grid_camera_pitch, ease);
+                let cam_target_y = detail_camera_target(*from_index);
+                self.camera.target = Vec3::new(0.0, cam_target_y * (1.0 - ease), 0.0);
+
+                if p >= 1.0 {
+                    Some(GalleryState::Grid)
+                } else {
+                    Some(GalleryState::TransitionToGrid { from_index: *from_index, progress: p })
+                }
+            }
+            _ => None,
+        };
+        if let Some(s) = new_state {
+            self.state = s;
+        }
     }
 
     fn view(&self, ctx: &ViewContext) -> Element {
         let mut children = vec![];
 
-        let title = text("MURAKUMO \u{2014} Material Gallery".to_string())
-            .mono()
-            .bold()
-            .font_size(24.0)
-            .color(Color::new(0.7, 0.8, 1.0, 0.9));
-        children.push(div().pos(20.0, 14.0).child(title));
-
-        let hint_alpha = if self.time < 5.0 {
-            ((5.0 - self.time) / 2.0).min(1.0)
-        } else {
-            0.0
+        let is_detail = match &self.state {
+            GalleryState::Detail { .. } => true,
+            GalleryState::TransitionToDetail { progress, .. } => *progress > 0.5,
+            GalleryState::TransitionToGrid { progress, .. } => *progress < 0.5,
+            GalleryState::Grid => false,
         };
-        if hint_alpha > 0.0 {
-            let hint = text("drag to orbit".to_string())
+
+        if is_detail {
+            // ── Detail mode UI ──
+            let idx = match &self.state {
+                GalleryState::Detail { index } => *index,
+                GalleryState::TransitionToDetail { index, .. } => *index,
+                GalleryState::TransitionToGrid { from_index, .. } => *from_index,
+                _ => 0,
+            };
+
+            // Back button (top-left)
+            let back = text("\u{2190} Back".to_string())
                 .mono()
-                .font_size(14.0)
-                .color(Color::new(0.5, 0.5, 0.6, hint_alpha * 0.7));
-            children.push(div().pos(ctx.width / 2.0 - 40.0, ctx.height - 28.0).child(hint));
-        }
+                .font_size(16.0)
+                .color(Color::new(0.7, 0.8, 1.0, 0.8));
+            children.push(div().pos(20.0, 14.0).child(back));
 
-        let vp = self.camera.view_proj();
-        for i in 0..MATERIAL_COUNT {
-            let col = i % GRID_COLS;
-            let row = i / GRID_COLS;
-            let x = (col as f32 - (GRID_COLS as f32 - 1.0) * 0.5) * SPACING;
-            let y = ((GRID_ROWS - 1 - row) as f32 - (GRID_ROWS as f32 - 1.0) * 0.5) * SPACING;
+            // Material name (large, centered top)
+            let name = MATERIAL_NAMES[idx];
+            let name_label = text(name.to_string())
+                .mono()
+                .bold()
+                .font_size(32.0)
+                .color(Color::new(0.8, 0.85, 1.0, 0.9));
+            let name_x = ctx.width / 2.0 - name.len() as f32 * 10.0;
+            children.push(div().pos(name_x.max(0.0), 14.0).child(name_label));
 
-            let world = glam::Vec4::new(x, y - 0.72, 0.0, 1.0);
-            let clip = vp * world;
-            if clip.w <= 0.0 {
-                continue;
-            }
-            let ndc = clip.truncate() / clip.w;
-            let sx = (ndc.x * 0.5 + 0.5) * ctx.width;
-            let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * ctx.height;
-
-            if sx < -100.0 || sx > ctx.width + 100.0 || sy < -50.0 || sy > ctx.height + 50.0 {
-                continue;
-            }
-
-            let name = MATERIAL_NAMES[i];
-            let label_x = sx - name.len() as f32 * 4.0;
-            let label = text(name.to_string())
+            // ESC hint
+            let esc = text("ESC to return".to_string())
                 .mono()
                 .font_size(12.0)
-                .color(Color::new(0.6, 0.65, 0.75, 0.85));
-            children.push(div().pos(label_x.max(2.0), sy).child(label));
-        }
+                .color(Color::new(0.4, 0.4, 0.5, 0.5));
+            children.push(div().pos(20.0, ctx.height - 24.0).child(esc));
+        } else {
+            // ── Grid mode UI ──
+            let title = text("MURAKUMO \u{2014} Material Gallery".to_string())
+                .mono()
+                .bold()
+                .font_size(24.0)
+                .color(Color::new(0.7, 0.8, 1.0, 0.9));
+            children.push(div().pos(20.0, 14.0).child(title));
 
-        children.push(
-            div()
-                .pos(20.0, ctx.height - 24.0)
-                .child(
-                    text("16 materials \u{00b7} Inline PBR + procedural \u{00b7} No UV seams".to_string())
-                        .mono()
-                        .font_size(12.0)
-                        .color(Color::new(0.3, 0.3, 0.4, 0.5)),
+            let hint_alpha = if self.time < 5.0 {
+                ((5.0 - self.time) / 2.0).min(1.0)
+            } else {
+                0.0
+            };
+            if hint_alpha > 0.0 {
+                let hint = text("click to view \u{00b7} drag to orbit".to_string())
+                    .mono()
+                    .font_size(14.0)
+                    .color(Color::new(0.5, 0.5, 0.6, hint_alpha * 0.7));
+                children.push(div().pos(ctx.width / 2.0 - 80.0, ctx.height - 28.0).child(hint));
+            }
+
+            // Material name labels in grid
+            let vp = self.camera.view_proj();
+            for i in 0..MATERIAL_COUNT {
+                let col = i % GRID_COLS;
+                let row = i / GRID_COLS;
+                let x = (col as f32 - (GRID_COLS as f32 - 1.0) * 0.5) * SPACING;
+                let y = ((GRID_ROWS - 1 - row) as f32 - (GRID_ROWS as f32 - 1.0) * 0.5) * SPACING;
+
+                let world = glam::Vec4::new(x, y - 0.72, 0.0, 1.0);
+                let clip = vp * world;
+                if clip.w <= 0.0 { continue; }
+                let ndc = clip.truncate() / clip.w;
+                let sx = (ndc.x * 0.5 + 0.5) * ctx.width;
+                let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * ctx.height;
+
+                if sx < -100.0 || sx > ctx.width + 100.0 || sy < -50.0 || sy > ctx.height + 50.0 {
+                    continue;
+                }
+
+                let name = MATERIAL_NAMES[i];
+                let label_x = sx - name.len() as f32 * 4.0;
+                let label = text(name.to_string())
+                    .mono()
+                    .font_size(12.0)
+                    .color(Color::new(0.6, 0.65, 0.75, 0.85));
+                children.push(div().pos(label_x.max(2.0), sy).child(label));
+            }
+
+            let count_str = format!("{} materials \u{00b7} Inline PBR + procedural \u{00b7} No UV seams", MATERIAL_COUNT);
+            children.push(
+                div().pos(20.0, ctx.height - 24.0).child(
+                    text(count_str).mono().font_size(12.0).color(Color::new(0.3, 0.3, 0.4, 0.5)),
                 ),
-        );
+            );
+        }
 
         div()
             .w(Px(ctx.width))
@@ -758,14 +1056,40 @@ impl DeclarativeApp for GalleryApp {
             InputEvent::PointerPressed { position, button } => {
                 if *button == MouseButton::Left {
                     self.drag_distance = 0.0;
+                    self.click_pos = (position.x, position.y);
                     self.camera.on_drag_start(position.x, position.y);
                     return true;
                 }
             }
-            InputEvent::PointerReleased { button, .. } => {
+            InputEvent::PointerReleased { position, button } => {
                 if *button == MouseButton::Left {
                     self.camera.on_drag_end();
+                    // Click detection: if drag was very short, treat as click
+                    if self.drag_distance < 5.0 {
+                        match &self.state {
+                            GalleryState::Grid => {
+                                if let Some(index) = self.hit_test_grid(position.x, position.y) {
+                                    self.enter_detail(index);
+                                }
+                            }
+                            GalleryState::Detail { .. } => {
+                                // Check if clicked "← Back" area (top-left)
+                                if position.x < 120.0 && position.y < 40.0 {
+                                    self.enter_grid();
+                                }
+                            }
+                            _ => {} // During transitions, ignore clicks
+                        }
+                    }
                     return true;
+                }
+            }
+            InputEvent::KeyInput { key, pressed, .. } => {
+                if *pressed && *key == Key::Escape {
+                    if matches!(self.state, GalleryState::Detail { .. }) {
+                        self.enter_grid();
+                        return true;
+                    }
                 }
             }
             _ => {}
@@ -826,9 +1150,12 @@ impl SceneApp for GalleryApp {
 
         // Register meshes
         renderer.add_mesh("icosphere", &procedural::icosphere(1.0, 4), None);
+        renderer.add_mesh("icosphere_hd", &procedural::icosphere(1.0, 6), None);
         renderer.add_mesh("cube", &procedural::cube(1.0), None);
         renderer.add_mesh("cylinder", &procedural::cylinder(0.5, 1.0, 32), None);
         renderer.add_mesh("plane", &procedural::plane(1.0, 1.0, 8, 8), None);
+        renderer.add_mesh("icosphere_huge", &procedural::icosphere(1.0, 5), None);
+        renderer.add_mesh("rock_mesh", &procedural::rock(1.0, 4, 0.35, 42.0), None);
         renderer.add_mesh("torus", &procedural::torus(0.4, 0.15, 32, 16), None);
 
         // ── Custom PBR Material Pipeline (replaces prepass) ──
@@ -946,16 +1273,70 @@ impl SceneApp for GalleryApp {
             bytemuck::bytes_of(&pbr_cam),
         );
 
-        // Build instances and upload
+        // Determine which materials to draw and how
+        let detail_index = match &self.state {
+            GalleryState::Detail { index } => Some(*index),
+            GalleryState::TransitionToDetail { index, progress } if *progress > 0.5 => Some(*index),
+            GalleryState::TransitionToGrid { from_index, progress } if *progress < 0.5 => Some(*from_index),
+            _ => None,
+        };
+
         let instance_size = std::mem::size_of::<InstanceData>();
         let mut instance_data = Vec::with_capacity(MATERIAL_COUNT * instance_size);
-        for i in 0..MATERIAL_COUNT {
-            let inst = build_instance(i, self.time);
-            instance_data.extend_from_slice(bytemuck::bytes_of(&inst));
+
+        if let Some(idx) = detail_index {
+            // Detail mode: single material at world center, large scale
+            let use_detail_mesh = is_landscape_material(idx);
+            for i in 0..MATERIAL_COUNT {
+                if i == idx {
+                    let scale = detail_scale(idx);
+                    let y_off = detail_y_offset(idx);
+                    let rot_speed = if use_detail_mesh { 0.0 } else { 0.1 }; // No rotation for flat surfaces
+                    let yaw = self.time * rot_speed;
+                    let model = Mat4::from_translation(Vec3::new(0.0, y_off, 0.0))
+                        * Mat4::from_rotation_y(yaw)
+                        * Mat4::from_scale(scale);
+                    let cols = model.to_cols_array_2d();
+                    let (metallic, roughness) = match idx {
+                        0 => (0.0, 0.1), 1 => (0.1, 0.05), 2 => (0.0, 0.3),
+                        3 => (0.3, 0.5), 4 => (0.0, 0.15), 5 => (0.0, 0.8),
+                        6 => (0.0, 0.9), 7 => (0.0, 0.4), 8 => (0.5, 0.2),
+                        9 => (0.2, 0.1), 10 => (1.0, 0.3), 11 => (0.0, 0.1),
+                        12 => (0.3, 0.2), 13 => (0.0, 0.4), 14 => (0.0, 0.5),
+                        15 => (0.0, 0.8), 16 => (0.1, 0.15), 17 => (0.0, 0.9),
+                        18 => (0.0, 0.8), 19 => (0.0, 0.7), 20 => (0.0, 0.4),
+                        21 => (0.0, 0.9),
+                        _ => (0.0, 0.5),
+                    };
+                    // material.w = 1.0 signals "flat surface mode" to shader (use wp instead of n)
+                    let flat_flag = if use_detail_mesh { 1.0 } else { 0.0 };
+                    let inst = InstanceData {
+                        model: cols,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        material: [metallic, roughness, idx as f32, flat_flag],
+                    };
+                    instance_data.extend_from_slice(bytemuck::bytes_of(&inst));
+                } else {
+                    // Zero-scale dummy for unused slots
+                    let inst = InstanceData {
+                        model: [[0.0; 4]; 4],
+                        color: [0.0; 4],
+                        material: [0.0, 0.5, i as f32, 0.0],
+                    };
+                    instance_data.extend_from_slice(bytemuck::bytes_of(&inst));
+                }
+            }
+        } else {
+            // Grid mode: all materials in grid
+            for i in 0..MATERIAL_COUNT {
+                let inst = build_instance(i, self.time);
+                instance_data.extend_from_slice(bytemuck::bytes_of(&inst));
+            }
         }
+
         ctx.queue.write_buffer(&pbr_pass.instance_buffer, 0, &instance_data);
 
-        // Draw each material with its mesh
+        // Draw materials
         {
             let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pbr_material_pass"),
@@ -979,14 +1360,46 @@ impl SceneApp for GalleryApp {
                 occlusion_query_set: None,
             });
 
+            let draw_range: Vec<usize> = if let Some(idx) = detail_index {
+                vec![idx]
+            } else {
+                (0..MATERIAL_COUNT).collect()
+            };
+
+            // Resolve mesh ID: detail mode may use different mesh
+            let get_mesh_id = |i: usize| -> &str {
+                if detail_index == Some(i) {
+                    detail_mesh_id(i)
+                } else {
+                    mesh_id_for_material(i)
+                }
+            };
+
+            // Pass 1: Opaque materials
             pass.set_pipeline(&pbr_pass.pipeline);
             pass.set_bind_group(0, &pbr_pass.camera_bind_group, &[]);
             pass.set_bind_group(1, &pbr_pass.light_bind_group, &[]);
             pass.set_bind_group(2, &pbr_pass.texture_bind_group, &[]);
             pass.set_bind_group(3, &pbr_pass.shadow_bind_group, &[]);
 
-            for i in 0..MATERIAL_COUNT {
-                let mesh_id = mesh_id_for_material(i);
+            for &i in &draw_range {
+                if is_transparent_material(i) { continue; }
+                let mesh_id = get_mesh_id(i);
+                if let Some(mesh) = renderer.get_mesh(mesh_id) {
+                    let offset = (i * instance_size) as u64;
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, pbr_pass.instance_buffer.slice(offset..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                }
+            }
+
+            // Pass 2: Transparent materials
+            pass.set_pipeline(&pbr_pass.transparent_pipeline);
+
+            for &i in &draw_range {
+                if !is_transparent_material(i) { continue; }
+                let mesh_id = get_mesh_id(i);
                 if let Some(mesh) = renderer.get_mesh(mesh_id) {
                     let offset = (i * instance_size) as u64;
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));

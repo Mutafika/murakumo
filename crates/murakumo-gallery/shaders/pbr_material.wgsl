@@ -444,47 +444,59 @@ fn mat_bubble(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialRes
     let n_dot_v = max(dot(n, view_dir), 0.0);
     let fresnel = pow(1.0 - n_dot_v, 3.0);
 
-    // Use normal direction for interference pattern (continuous on sphere)
-    let p = n.xy * 2.0;
-    let thick = 350.0 + p.y * 100.0
-        + sin(p.x * 3.0 + p.y * 2.0 + t * 0.4) * 80.0
-        + sin(p.y * 7.0 + t * 0.7) * 40.0
-        + sin(p.x * 5.0 - p.y * 4.0 + t * 0.2) * 30.0;
-    let pd = 2.0 * 1.33 * thick;
+    // ── Flowing thickness field ──
+    let p = n;
+    let gravity = (1.0 - p.y) * 0.5 + 0.5;
+    let theta = atan2(p.z, p.x) + t * 0.05;
+    let phi = acos(clamp(p.y, -1.0, 1.0));
+
+    let thick = 200.0 + gravity * 200.0
+        + sin(theta * 2.0 + phi * 3.0 + t * 0.12) * 60.0
+        + sin(theta * 5.0 - phi * 2.0 + t * 0.08) * 30.0
+        + sin(phi * 7.0 + t * 0.15) * 20.0
+        + sin(theta * 3.0 + phi * 5.0 - t * 0.1) * 15.0;
+
+    // ── Thin-film interference (view-dependent) ──
+    let cos_refract = sqrt(1.0 - (1.0 - n_dot_v * n_dot_v) / (1.33 * 1.33));
+    let opd = 2.0 * 1.33 * thick * cos_refract;
+
+    // Vivid rainbow: wider wavelength spread for saturated colors
     let irid = vec3<f32>(
-        0.5 + 0.5 * cos(TAU * pd / 700.0),
-        0.5 + 0.5 * cos(TAU * pd / 530.0),
-        0.5 + 0.5 * cos(TAU * pd / 430.0),
+        0.5 + 0.5 * cos(TAU * opd / 700.0),
+        0.5 + 0.5 * cos(TAU * opd / 530.0),
+        0.5 + 0.5 * cos(TAU * opd / 400.0),
     );
 
-    let thick_b = thick + 150.0 + sin(p.x * 4.0 - p.y * 3.0 - t * 0.3) * 50.0;
-    let pd_b = 2.0 * 1.33 * thick_b;
-    let irid_b = vec3<f32>(
-        0.5 + 0.5 * cos(TAU * pd_b / 700.0),
-        0.5 + 0.5 * cos(TAU * pd_b / 530.0),
-        0.5 + 0.5 * cos(TAU * pd_b / 430.0),
+    // Back-surface interference
+    let opd2 = 2.0 * 1.33 * (thick * 1.15 + 80.0) * cos_refract;
+    let irid2 = vec3<f32>(
+        0.5 + 0.5 * cos(TAU * opd2 / 700.0),
+        0.5 + 0.5 * cos(TAU * opd2 / 530.0),
+        0.5 + 0.5 * cos(TAU * opd2 / 400.0),
     );
 
-    let range_f = max(max(irid.x, irid.y), irid.z) - min(min(irid.x, irid.y), irid.z);
-    let mask_f = smoothstep(0.3, 0.85, range_f) * (0.03 + fresnel * 0.12);
-    let range_b = max(max(irid_b.x, irid_b.y), irid_b.z) - min(min(irid_b.x, irid_b.y), irid_b.z);
-    let mask_b = smoothstep(0.3, 0.85, range_b) * (0.015 + fresnel * 0.06);
+    let blend = mix(irid, irid2, 0.3);
 
-    let sheen = fresnel * vec3<f32>(0.2, 0.25, 0.35) * 0.08;
-    let bands = irid * mask_f + irid_b * mask_b;
-    let band_lum = max(bands.x, max(bands.y, bands.z));
+    // ── Saturate the rainbow — push colors away from gray ──
+    let lum = dot(blend, vec3<f32>(0.333));
+    let saturated = mix(vec3(lum), blend, 1.8); // boost saturation
+    let vivid = max(saturated, vec3(0.0));
 
-    let refl_dir = reflect(-view_dir, n);
-    let env_col = env_reflect(refl_dir, t);
-    let env_contrib = env_col * fresnel * 0.4;
+    // Color visible across surface, stronger at edges
+    let colored = vivid * (0.15 + fresnel * 0.7);
 
-    r.albedo = vec3<f32>(0.15, 0.18, 0.25) * 0.15;
-    r.emission = sheen + bands + env_contrib;
+    // ── Sharp white rim glint ──
+    let rim = pow(1.0 - n_dot_v, 8.0);
+    let glint = vec3<f32>(1.0) * rim * 0.6;
+
+    r.albedo = vec3<f32>(0.0);
+    r.emission = colored + glint;
     r.metallic = 0.0;
-    r.roughness = 0.1;
-    r.alpha = 0.15 + band_lum * 3.0 + fresnel * 0.3;
+    r.roughness = 0.02;
+    // Very transparent — thin film, not solid glass
+    r.alpha = 0.06 + fresnel * 0.35;
     r.normal = n;
-    r.is_emissive_only = false;
+    r.is_emissive_only = true;
     return r;
 }
 
@@ -694,59 +706,111 @@ fn mat_water(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResu
 
 // ── 5: Fire ──
 
-fn mat_fire(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, uv: vec2<f32>) -> MaterialResult {
-    var r: MaterialResult;
-    let tt = t * 1.0;
-    // Use UV for cylinder (fire wraps around cylinder — UV.x = around, UV.y = height)
-    let height = 1.0 - uv.y;
-    let angle_val = uv.x;
-    let scroll_y = height * 3.0 - tt * 2.0;
-    let p = vec2<f32>(angle_val * 4.0, scroll_y);
+// Fire density field (3D volume)
+fn fire_density(p: vec3<f32>, t: f32) -> f32 {
+    // Fire rises: scroll Y upward
+    let scroll = vec3<f32>(p.x, p.y - t * 1.8, p.z);
 
-    let warp_x = simplex2d(p * 1.5 + vec2<f32>(tt * 0.3, 3.7)) * 0.4;
-    let warp_y = simplex2d(p * 1.5 + vec2<f32>(7.1, tt * 0.2)) * 0.3;
-    let warped = p + vec2<f32>(warp_x, warp_y);
+    // Strong turbulence warp — break up the shape
+    let warp = vec3<f32>(
+        simplex3d(scroll * 2.5 + vec3<f32>(t * 0.4, 0.0, 3.7)),
+        simplex3d(scroll * 2.0 + vec3<f32>(0.0, t * 0.25, 7.1)),
+        simplex3d(scroll * 2.5 + vec3<f32>(5.2, t * 0.35, 0.0))
+    );
+    let warped = scroll + warp * 0.5;
 
-    let n1 = simplex2d(warped * 1.0) * 0.5;
-    let n2 = simplex2d(warped * 2.3 + vec2<f32>(5.2, 1.3)) * 0.25;
-    let n3 = simplex2d(warped * 5.0 + vec2<f32>(1.7, 9.2)) * 0.12;
-    let n4 = simplex2d(warped * 10.0) * 0.06;
+    // FBM noise (4 octaves for detail)
+    let n1 = simplex3d(warped * 2.0) * 0.45;
+    let n2 = simplex3d(warped * 4.5 + vec3<f32>(5.2, 1.3, 2.8)) * 0.25;
+    let n3 = simplex3d(warped * 9.0 + vec3<f32>(1.7, 9.2, 4.1)) * 0.15;
+    let n4 = simplex3d(warped * 18.0 + vec3<f32>(3.1, 6.4, 8.7)) * 0.08;
     let noise = n1 + n2 + n3 + n4;
 
-    let shape = smoothstep(1.0, 0.0, height) * smoothstep(-0.05, 0.15, height);
-    let density = (noise * 0.5 + 0.5) * shape;
-    let d = max(density - 0.15, 0.0) * 3.5;
+    // Shape: organic flame — noise distorts the boundary
+    let radial = length(vec2<f32>(p.x, p.z));
+    let height = (p.y + 1.0) * 0.5;
 
-    let temp = d * (1.0 - height * 0.5);
-    var fire_col: vec3<f32>;
-    if temp > 0.8 { fire_col = mix(vec3<f32>(1.0, 0.85, 0.2), vec3<f32>(1.0, 0.98, 0.9), (temp - 0.8) / 0.4); }
-    else if temp > 0.5 { fire_col = mix(vec3<f32>(1.0, 0.4, 0.0), vec3<f32>(1.0, 0.85, 0.2), (temp - 0.5) / 0.3); }
-    else if temp > 0.2 { fire_col = mix(vec3<f32>(0.8, 0.1, 0.0), vec3<f32>(1.0, 0.4, 0.0), (temp - 0.2) / 0.3); }
-    else { fire_col = mix(vec3<f32>(0.15, 0.0, 0.0), vec3<f32>(0.8, 0.1, 0.0), temp / 0.2); }
+    // Boundary noise: distort the cone edge so it's ragged
+    let edge_noise = simplex3d(vec3<f32>(p.x * 4.0, p.y * 2.0 - t * 3.0, p.z * 4.0)) * 0.2
+                   + simplex3d(vec3<f32>(p.x * 8.0, p.y * 4.0 - t * 5.0, p.z * 8.0)) * 0.1;
+    let cone_radius = mix(0.55, 0.05, height * height) + edge_noise;
 
-    var emission = fire_col * d * 2.5;
-    let blue_zone = smoothstep(0.3, 0.0, height) * smoothstep(0.3, 0.8, d);
-    emission = mix(emission, vec3<f32>(0.3, 0.5, 1.5) * d, blue_zone * 0.4);
+    let shape = smoothstep(cone_radius, cone_radius * 0.15, radial)
+              * smoothstep(-0.05, 0.15, height)
+              * smoothstep(1.05, 0.5, height);
 
-    // Embers
-    let ember_uv = vec2<f32>(angle_val * 12.0, (1.0 - uv.y) * 8.0);
-    let ember_cell = floor(ember_uv);
-    let ember_hash = fract(sin(dot(ember_cell, vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let ember_speed = 0.5 + ember_hash * 1.5;
-    let ember_y = fract(ember_hash * 3.0 - tt * ember_speed);
-    let ember_x = fract(ember_hash * 7.0) + sin(tt * 2.0 + ember_hash * 10.0) * 0.15;
-    let ember_dist = length(fract(ember_uv) - vec2<f32>(ember_x, ember_y));
-    let ember = smoothstep(0.04, 0.0, ember_dist) * step(0.65, ember_hash);
-    emission += vec3<f32>(1.0, 0.7, 0.2) * ember * 2.0;
+    return max((noise * 0.5 + 0.5) * shape - 0.08, 0.0) * 3.0;
+}
 
-    let flicker = 0.88 + 0.12 * sin(tt * 15.0) * sin(tt * 9.3 + 1.7);
-    emission *= flicker;
+fn mat_fire(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
+    var r: MaterialResult;
+
+    // Ray-sphere intersection for volumetric march
+    let view_dir = normalize(wp - ep);
+    let sphere_radius = 1.0;
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - sphere_radius * sphere_radius;
+    let disc = b * b - c_val;
+
+    if disc < 0.0 {
+        r.albedo = vec3(0.0); r.emission = vec3(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.8; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far = -b + sqrt_disc;
+    let march_dist = t_far - t_near;
+
+    let steps = 40;
+    let step_size = march_dist / f32(steps);
+    var transmittance = 1.0;
+    var accum_color = vec3<f32>(0.0);
+
+    for (var i = 0; i < 40; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let sample_world = ep + view_dir * ray_t;
+        let local_pos = sample_world - obj_center;
+
+        let d = fire_density(local_pos, t);
+        if d > 0.001 {
+            let height = (local_pos.y + 1.0) * 0.5;
+
+            // Temperature-based color (height + density)
+            let temp = d * (1.0 - height * 0.4);
+            var fire_col: vec3<f32>;
+            if temp > 0.8 {
+                fire_col = mix(vec3<f32>(1.0, 0.9, 0.3), vec3<f32>(1.0, 0.98, 0.85), (temp - 0.8) / 0.4);
+            } else if temp > 0.5 {
+                fire_col = mix(vec3<f32>(1.0, 0.45, 0.0), vec3<f32>(1.0, 0.9, 0.3), (temp - 0.5) / 0.3);
+            } else if temp > 0.2 {
+                fire_col = mix(vec3<f32>(0.85, 0.12, 0.0), vec3<f32>(1.0, 0.45, 0.0), (temp - 0.2) / 0.3);
+            } else {
+                fire_col = mix(vec3<f32>(0.2, 0.02, 0.0), vec3<f32>(0.85, 0.12, 0.0), temp / 0.2);
+            }
+
+            // Blue core at base
+            let blue_zone = smoothstep(0.3, 0.0, height) * smoothstep(0.3, 0.9, d);
+            fire_col = mix(fire_col, vec3<f32>(0.3, 0.5, 1.5), blue_zone * 0.4);
+
+            let extinct = d * 8.0 * step_size;
+            accum_color += fire_col * d * step_size * transmittance * 5.0;
+            transmittance *= exp(-extinct);
+        }
+        if transmittance < 0.02 { break; }
+    }
+
+    // Flicker
+    let flicker = 0.88 + 0.12 * sin(t * 15.0) * sin(t * 9.3 + 1.7);
+    accum_color *= flicker;
 
     r.albedo = vec3(0.0);
-    r.emission = emission;
+    r.emission = accum_color;
     r.metallic = 0.0;
     r.roughness = 0.8;
-    r.alpha = clamp(d * 1.5, 0.0, 1.0);
+    r.alpha = clamp((1.0 - transmittance) * 1.2, 0.0, 1.0);
     r.normal = n;
     r.is_emissive_only = true;
     return r;
@@ -768,41 +832,65 @@ fn smoke_density(p: vec3<f32>, t: f32) -> f32 {
     return max(nn * shape - 0.1, 0.0) * 1.5;
 }
 
-fn mat_smoke(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, uv: vec2<f32>) -> MaterialResult {
+fn mat_smoke(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
     var r: MaterialResult;
     let tt = t * 0.5;
-    let center = uv - 0.5;
-    let dist = length(center);
-    let edge = 1.0 - smoothstep(0.45, 0.5, dist);
 
-    let ray_origin = vec3<f32>((uv.x - 0.5) * 2.0, 1.0 - uv.y, -0.5);
-    let ray_dir = vec3<f32>(0.0, 0.0, 1.0);
-    let step_size = 1.2 / 24.0;
+    // Ray-sphere intersection in world space for volumetric march
+    let view_dir = normalize(wp - ep);
+    let sphere_radius = 1.0;
+
+    // Ray from camera through this fragment, intersect bounding sphere
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - sphere_radius * sphere_radius;
+    let disc = b * b - c_val;
+
+    if disc < 0.0 {
+        r.albedo = vec3(0.0); r.emission = vec3(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.9; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far = -b + sqrt_disc;
+    let march_dist = t_far - t_near;
+
+    let steps = 32;
+    let step_size = march_dist / f32(steps);
     var transmittance = 1.0;
     var accum_color = vec3<f32>(0.0);
-    let absorption = 6.0;
+    let absorption = 5.0;
     let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
-    let base_col = vec3<f32>(0.15, 0.16, 0.22);
-    let scatter_col = vec3<f32>(0.25, 0.28, 0.38);
-    let highlight_col = vec3<f32>(0.4, 0.42, 0.55);
+    let base_col = vec3<f32>(0.12, 0.13, 0.18);
+    let scatter_col = vec3<f32>(0.22, 0.25, 0.35);
+    let highlight_col = vec3<f32>(0.45, 0.48, 0.6);
 
-    for (var i = 0; i < 24; i++) {
-        let pos = ray_origin + ray_dir * (f32(i) * step_size);
-        let d = smoke_density(pos, tt);
+    for (var i = 0; i < 32; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let sample_world = ep + view_dir * ray_t;
+        // Convert to local space (centered, unit sphere)
+        let local_pos = sample_world - obj_center;
+
+        let d = smoke_density(local_pos, tt);
         if d > 0.001 {
             let extinct = d * absorption * step_size;
             let tr_step = exp(-extinct);
-            let light_sample = smoke_density(pos + light_dir * 0.15, tt);
-            let light_sample2 = smoke_density(pos + light_dir * 0.3, tt);
-            let light_atten = exp(-(light_sample + light_sample2 * 0.5) * 2.0);
-            let lit_color = mix(base_col, mix(scatter_col, highlight_col, light_atten), light_atten * 0.7);
-            accum_color += lit_color * d * step_size * transmittance * 3.5;
+
+            // Light march: 2 samples toward light
+            let ls1 = smoke_density(local_pos + light_dir * 0.12, tt);
+            let ls2 = smoke_density(local_pos + light_dir * 0.25, tt);
+            let light_atten = exp(-(ls1 + ls2 * 0.5) * 2.5);
+
+            let lit_color = mix(base_col, mix(scatter_col, highlight_col, light_atten), light_atten * 0.8);
+            accum_color += lit_color * d * step_size * transmittance * 4.0;
             transmittance *= tr_step;
         }
-        if transmittance < 0.03 { break; }
+        if transmittance < 0.02 { break; }
     }
 
-    let alpha = (1.0 - transmittance) * edge * 0.9;
+    let alpha = (1.0 - transmittance) * 0.95;
 
     r.albedo = vec3(0.0);
     r.emission = accum_color;
@@ -1112,57 +1200,7 @@ fn mat_shield(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialRes
     return r;
 }
 
-// ── 13: Warp ──
-
-fn mat_warp(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, uv: vec2<f32>) -> MaterialResult {
-    var r: MaterialResult;
-    let center = vec2<f32>(0.5, 0.5);
-    let to_center = uv - center;
-    let dist = length(to_center);
-    let angle_val = atan2(to_center.y, to_center.x);
-    let radius = 0.5;
-    let radius_mask = 1.0 - smoothstep(radius * 0.5, radius, dist);
-
-    let strength = 1.5;
-    let twist = strength * (1.0 - dist / radius) * TAU;
-    let rotation = t * 0.8;
-    let spiral_a = angle_val + twist + rotation;
-    let warped_d = dist + sin(spiral_a * 3.0 + t) * 0.02 * strength;
-    let warped_uv = center + vec2<f32>(cos(spiral_a), sin(spiral_a)) * warped_d;
-
-    let swirl = fbm_grad4(warped_uv * 4.0 + vec2<f32>(t * 0.3, t * 0.2)) * strength;
-    let depth_rings = sin(dist * 30.0 - t * 4.0) * 0.5 + 0.5;
-    let tunnel = depth_rings * (1.0 - dist / radius);
-
-    let aberr = strength * 0.03 * (1.0 - dist / radius);
-    let dir = normalize(to_center + vec2(0.001));
-    let spiral_r = sin((length(uv + dir * aberr - center) * 20.0 - t * 3.0) + spiral_a * 2.0) * 0.5 + 0.5;
-    let spiral_g = sin((dist * 20.0 - t * 3.0) + spiral_a * 2.0 + 2.094) * 0.5 + 0.5;
-    let spiral_b = sin((length(uv - dir * aberr - center) * 20.0 - t * 3.0) + spiral_a * 2.0 + 4.189) * 0.5 + 0.5;
-    let chromatic = vec3<f32>(spiral_r, spiral_g, spiral_b);
-
-    let edge_d = abs(dist - radius * 0.7);
-    let edge_glow = exp(-edge_d * 15.0) * 0.5;
-    let core_dark = smoothstep(0.05, 0.15, dist);
-    let core_bright = exp(-dist * 20.0) * 2.0;
-
-    let dist_col = vec3<f32>(0.5, 0.2, 0.9);
-    let base = chromatic * dist_col * (tunnel * 0.5 + 0.5);
-    let noise_tint = vec3<f32>(swirl * 0.3 + 0.7) * dist_col;
-    let final_c = (base * 0.6 + noise_tint * 0.4) * core_dark + vec3<f32>(core_bright) * dist_col;
-    let with_edge = final_c + dist_col * edge_glow;
-
-    r.albedo = vec3(0.0);
-    r.emission = with_edge;
-    r.metallic = 0.0;
-    r.roughness = 0.4;
-    r.alpha = clamp(radius_mask * (0.4 + tunnel * 0.3 + edge_glow + core_bright * 0.5), 0.0, 1.0);
-    r.normal = n;
-    r.is_emissive_only = true;
-    return r;
-}
-
-// ── 14: Dissolve ──
+// ── 13: Dissolve ──
 
 fn warped_fbm(p: vec2<f32>, t: f32) -> f32 {
     let q = vec2<f32>(fbm5(p), fbm5(p + vec2<f32>(5.2, 1.3)));
@@ -1243,44 +1281,613 @@ fn arc_brightness(p: vec2<f32>, s_y: f32, e_y: f32, seed: f32, ts: f32, thick: f
     return (core + glow + outer) * end_fade;
 }
 
-fn mat_lightning(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, uv: vec2<f32>) -> MaterialResult {
+// 3D arc sample: distance from sample point p (object-local) to a vertical
+// arc whose axis is at (xc, zc), with x/z perturbation along the y axis.
+fn arc_brightness_3d(p: vec3<f32>, seed: f32, ts: f32, thick: f32, xc: f32, zc: f32) -> f32 {
+    let y_norm = (p.y + 1.0) * 0.5;
+    if y_norm < 0.0 || y_norm > 1.0 { return 0.0; }
+    let ox = lightning_offset(y_norm, seed, ts);
+    let oz = lightning_offset(y_norm, seed * 1.71 + 3.3, ts);
+    let dx = p.x - xc - ox;
+    let dz = p.z - zc - oz;
+    let d2 = dx * dx + dz * dz;
+    let core  = exp(-d2 / (thick * thick * 0.3))  * 1.5;
+    let glow  = exp(-d2 / (thick * thick * 4.0))  * 0.6;
+    let outer = exp(-d2 / (thick * thick * 16.0)) * 0.2;
+    let end_fade = smoothstep(0.0, 0.05, y_norm) * smoothstep(1.0, 0.95, y_norm);
+    return (core + glow + outer) * end_fade;
+}
+
+fn mat_lightning(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
     var r: MaterialResult;
+
+    // Ray-sphere intersection (radius = 1 in object space)
+    let view_dir = normalize(wp - ep);
+    let sphere_radius = 1.0;
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - sphere_radius * sphere_radius;
+    let disc = b * b - c_val;
+    if disc < 0.0 {
+        r.albedo = vec3(0.0); r.emission = vec3(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.3; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far  = -b + sqrt_disc;
+    let march_dist = t_far - t_near;
+
     let tt = t * 2.0;
     let ts = floor(tt * 4.0) * 0.1;
-    let thick = 0.04;
+    let thick = 0.06;
 
-    var total = 0.0;
+    // 4 主弧 — 軸位置を球内ランダムに散らす
+    var arc_xc: array<f32, 4>;
+    var arc_zc: array<f32, 4>;
+    var arc_seed: array<f32, 4>;
     for (var i = 0; i < 4; i++) {
-        let seed = f32(i) * 17.31 + 5.7;
-        let xs = 0.3 + hash11(seed + 0.1) * 0.4;
-        total += arc_brightness(uv, 0.05, 0.95, seed, ts, thick, xs);
-        for (var b = 0; b < 3; b++) {
-            let bs = seed + f32(b) * 23.17;
-            let bc = hash11(bs + ts * 3.0);
-            if bc < 0.4 {
-                let by = 0.2 + hash11(bs + 1.0 + ts) * 0.6;
-                let bx = xs + lightning_offset(by, seed, ts);
-                let bd = (hash11(bs + 2.0 + ts) - 0.5) * 0.3;
-                let bl = 0.1 + hash11(bs + 3.0) * 0.2;
-                let bp = vec2<f32>(uv.x - bd * (uv.y - by) / bl, uv.y);
-                total += arc_brightness(bp, by, min(by + bl, 0.95), bs * 7.3, ts, thick * 0.6, bx) * 0.5;
+        let s = f32(i) * 17.31 + 5.7;
+        arc_seed[i] = s;
+        arc_xc[i] = (hash11(s + 0.1) - 0.5) * 0.7;
+        arc_zc[i] = (hash11(s + 0.27) - 0.5) * 0.7;
+    }
+
+    let steps = 36;
+    let step_size = march_dist / f32(steps);
+    var transmittance = 1.0;
+    var accum = vec3<f32>(0.0);
+
+    for (var i = 0; i < 36; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let p = ep + view_dir * ray_t - obj_center;
+
+        var total = 0.0;
+        for (var a = 0; a < 4; a++) {
+            total += arc_brightness_3d(p, arc_seed[a], ts, thick, arc_xc[a], arc_zc[a]);
+            // 分岐 (枝)
+            for (var bi = 0; bi < 2; bi++) {
+                let bs = arc_seed[a] + f32(bi) * 23.17;
+                let bc = hash11(bs + ts * 3.0);
+                if bc < 0.4 {
+                    let by = (hash11(bs + 1.0 + ts) - 0.5) * 1.2;
+                    let bx = arc_xc[a] + lightning_offset((by + 1.0) * 0.5, arc_seed[a], ts);
+                    let bz = arc_zc[a] + lightning_offset((by + 1.0) * 0.5, arc_seed[a] * 1.71 + 3.3, ts);
+                    let dx = p.x - bx;
+                    let dy = p.y - by;
+                    let dz = p.z - bz;
+                    let bd2 = dx * dx + dy * dy * 0.4 + dz * dz;
+                    let blen = 0.25;
+                    if bd2 < blen * blen {
+                        total += exp(-bd2 / (thick * thick * 1.5)) * 0.6;
+                    }
+                }
+            }
+        }
+
+        if total > 0.001 {
+            let base_col = vec3<f32>(0.3, 0.5, 1.0);
+            let white_mix = smoothstep(0.5, 2.0, total);
+            let core_col = mix(base_col, vec3<f32>(1.0), white_mix);
+
+            let extinct = total * 5.0 * step_size;
+            accum += core_col * total * step_size * transmittance * 6.0;
+            transmittance *= exp(-extinct);
+        }
+        if transmittance < 0.02 { break; }
+    }
+
+    let flicker = 0.8 + 0.2 * sin(tt * 30.0) * sin(tt * 17.0 + 1.3);
+    accum *= flicker;
+
+    r.albedo = vec3(0.0);
+    r.emission = accum;
+    r.metallic = 0.0;
+    r.roughness = 0.3;
+    r.alpha = clamp((1.0 - transmittance) * 1.5, 0.0, 1.0);
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
+// ── Shared: 3D Voronoi ──
+
+fn voronoi3d(p: vec3<f32>) -> vec2<f32> {
+    let cell = floor(p);
+    let frac = fract(p);
+    var min_d = 1.0;
+    var second_d = 1.0;
+    for (var dz = -1; dz <= 1; dz++) {
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let neighbor = vec3<f32>(f32(dx), f32(dy), f32(dz));
+                let nc = cell + neighbor;
+                let point = neighbor + vec3<f32>(
+                    fract(sin(dot(nc, vec3(127.1, 311.7, 74.7))) * 43758.5453),
+                    fract(sin(dot(nc, vec3(269.5, 183.3, 246.1))) * 43758.5453),
+                    fract(sin(dot(nc, vec3(113.5, 271.9, 124.6))) * 43758.5453)
+                );
+                let dd = length(frac - point);
+                if dd < min_d { second_d = min_d; min_d = dd; }
+                else if dd < second_d { second_d = dd; }
             }
         }
     }
+    return vec2(min_d, second_d);
+}
 
-    let base_col = vec3<f32>(0.3, 0.5, 1.0);
-    let white_mix = smoothstep(0.5, 2.0, total);
-    let core_col = mix(base_col, vec3<f32>(1.0), white_mix);
-    let final_c = core_col * total * 3.0;
-    let flicker = 0.8 + 0.2 * sin(tt * 30.0) * sin(tt * 17.0 + 1.3);
+// ── 21: Rock ──
+// Shared rock surface function — reused by Lava
+struct RockSurface {
+    albedo: vec3<f32>,
+    normal: vec3<f32>,
+    roughness: f32,
+};
+
+fn rock_height_sample(n: vec3<f32>, scale: f32) -> f32 {
+    let p = n * scale;
+    let warp = vec3<f32>(
+        simplex3d(p * 0.7 + vec3(0.0, 3.2, 7.1)),
+        simplex3d(p * 0.7 + vec3(5.4, 0.0, 2.3)),
+        simplex3d(p * 0.7 + vec3(1.8, 6.7, 0.0)),
+    );
+    let w = p + warp * 0.6;
+    let h1 = simplex3d(w * 0.8) * 0.5 + 0.5;
+    let h2 = simplex3d(w * 2.0 + vec3(3.1, 7.4, 1.8)) * 0.5 + 0.5;
+    let h3 = simplex3d(w * 4.5 + vec3(8.2, 1.6, 5.3)) * 0.5 + 0.5;
+    return h1 * 0.35 + h2 * 0.25 + h3 * 0.2;
+}
+
+fn rock_height_gradient(n: vec3<f32>, scale: f32, eps: f32) -> vec3<f32> {
+    let hpx = rock_height_sample(n + vec3(eps, 0.0, 0.0), scale);
+    let hnx = rock_height_sample(n - vec3(eps, 0.0, 0.0), scale);
+    let hpy = rock_height_sample(n + vec3(0.0, eps, 0.0), scale);
+    let hny = rock_height_sample(n - vec3(0.0, eps, 0.0), scale);
+    let hpz = rock_height_sample(n + vec3(0.0, 0.0, eps), scale);
+    let hnz = rock_height_sample(n - vec3(0.0, 0.0, eps), scale);
+    return vec3<f32>(hpx - hnx, hpy - hny, hpz - hnz);
+}
+
+fn eval_rock(n: vec3<f32>, scale: f32) -> RockSurface {
+    var rs: RockSurface;
+    let p = n * scale;
+
+    // ── Domain warping for organic, non-repeating look ──
+    let warp1 = vec3<f32>(
+        simplex3d(p * 0.7 + vec3(0.0, 3.2, 7.1)),
+        simplex3d(p * 0.7 + vec3(5.4, 0.0, 2.3)),
+        simplex3d(p * 0.7 + vec3(1.8, 6.7, 0.0)),
+    );
+    let warped = p + warp1 * 0.6;
+
+    // ── Height field: FBM for terrain-like bumps ──
+    let h1 = simplex3d(warped * 0.8) * 0.5 + 0.5;                     // large mounds
+    let h2 = simplex3d(warped * 2.0 + vec3(3.1, 7.4, 1.8)) * 0.5 + 0.5; // medium ridges
+    let h3 = simplex3d(warped * 4.5 + vec3(8.2, 1.6, 5.3)) * 0.5 + 0.5; // small bumps
+    let h4 = simplex3d(warped * 10.0 + vec3(2.7, 5.9, 3.4)) * 0.5 + 0.5; // fine grain
+    let h5 = simplex3d(warped * 20.0 + vec3(6.1, 3.3, 9.7)) * 0.5 + 0.5; // micro detail
+    let height = h1 * 0.35 + h2 * 0.25 + h3 * 0.2 + h4 * 0.12 + h5 * 0.08;
+
+    // ── Crevices: sharp dips where height is low ──
+    let crevice = smoothstep(0.35, 0.25, height);
+
+    // ── Color: mineral layers, not uniform gray ──
+    let dark_rock = vec3<f32>(0.04, 0.035, 0.03);
+    let mid_rock = vec3<f32>(0.12, 0.10, 0.08);
+    let light_rock = vec3<f32>(0.20, 0.17, 0.14);
+    let warm_tint = vec3<f32>(0.14, 0.09, 0.05);  // iron oxide
+
+    // Layer blending based on warped noise
+    let layer = simplex3d(warped * 1.2 + vec3(4.4, 2.2, 8.8)) * 0.5 + 0.5;
+    var color = mix(mid_rock, light_rock, height);
+    color = mix(color, warm_tint, layer * 0.3);          // warm patches
+    color = mix(color, dark_rock, crevice * 0.9);         // dark crevices
+    color *= 0.6 + height * 0.5;                          // crude AO: low areas darken
+
+    // Exposed faces are lighter
+    let exposure = simplex3d(warped * 3.0 + vec3(1.1, 5.5, 2.2)) * 0.5 + 0.5;
+    color = mix(color, light_rock * 1.1, exposure * 0.2 * height);
+
+    rs.albedo = color;
+
+    // ── Roughness: mostly rough, polished only where worn ──
+    rs.roughness = 0.8 + h4 * 0.15 - height * 0.1;
+
+    // ── Normal: gradient of the height field ──
+    let eps = 0.01;
+    // Compute gradient by sampling height at 6 offset positions
+    let grad = rock_height_gradient(n, scale, eps);
+
+    // Fine detail bump (separate, higher frequency)
+    let fg = vec3<f32>(
+        simplex3d((n + vec3(eps, 0.0, 0.0)) * scale * 12.0) - simplex3d((n - vec3(eps, 0.0, 0.0)) * scale * 12.0),
+        simplex3d((n + vec3(0.0, eps, 0.0)) * scale * 12.0) - simplex3d((n - vec3(0.0, eps, 0.0)) * scale * 12.0),
+        simplex3d((n + vec3(0.0, 0.0, eps)) * scale * 12.0) - simplex3d((n - vec3(0.0, 0.0, eps)) * scale * 12.0),
+    );
+
+    rs.normal = normalize(n + grad * 1.8 + fg * 0.25);
+
+    return rs;
+}
+
+fn mat_rock(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResult {
+    var r: MaterialResult;
+    let rock = eval_rock(n, 3.0);
+
+    r.albedo = rock.albedo;
+    r.emission = vec3(0.0);
+    r.metallic = 0.0;
+    r.roughness = rock.roughness;
+    r.alpha = 1.0;
+    r.normal = rock.normal;
+    r.is_emissive_only = false;
+    return r;
+}
+
+// ── 15: Lava (Rock + molten glow) ──
+
+fn mat_lava(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResult {
+    var r: MaterialResult;
+
+    // Get rock base
+    let rock = eval_rock(n, 3.0);
+
+    // Voronoi cracks for lava channels
+    let tt = t * 0.12;
+    let flow_warp = vec3<f32>(
+        simplex3d(n * 1.5 + vec3(tt, 0.0, 3.7)) * 0.25,
+        simplex3d(n * 1.5 + vec3(0.0, tt * 0.8, 7.1)) * 0.25,
+        simplex3d(n * 1.5 + vec3(5.2, tt * 0.6, 0.0)) * 0.25
+    );
+    let p = n * 2.5 + flow_warp;
+
+    let v1 = voronoi3d(p);
+    let v2 = voronoi3d(p * 2.0 + vec3(5.0));
+
+    // Crack edges — where lava is visible between rock plates
+    let edge1 = v1.y - v1.x;
+    let edge2 = v2.y - v2.x;
+    let crack = smoothstep(0.14, 0.02, edge1) * 0.7 + smoothstep(0.12, 0.02, edge2) * 0.3;
+
+    // Pulsing glow in cracks
+    let pulse = sin(n.x * 3.0 + n.y * 5.0 + t * 0.4) * 0.25 + 0.75;
+    let heat = crack * pulse;
+
+    // Temperature color: deep crack = white hot → orange → dark red
+    var lava_col: vec3<f32>;
+    if heat > 0.7 { lava_col = mix(vec3<f32>(1.0, 0.7, 0.1), vec3<f32>(1.0, 0.95, 0.8), (heat - 0.7) / 0.3); }
+    else if heat > 0.35 { lava_col = mix(vec3<f32>(0.9, 0.15, 0.0), vec3<f32>(1.0, 0.7, 0.1), (heat - 0.35) / 0.35); }
+    else { lava_col = mix(vec3<f32>(0.2, 0.01, 0.0), vec3<f32>(0.9, 0.15, 0.0), heat / 0.35); }
+
+    // Blend rock surface with lava glow
+    // Non-crack areas: pure rock. Crack areas: darker (glow comes from emission)
+    let rock_darkened = rock.albedo * (1.0 - crack * 0.9);
+    // Edge of crack: rock gets slightly red-hot tint
+    let edge_heat = smoothstep(0.0, 0.2, crack) * (1.0 - smoothstep(0.3, 0.8, crack));
+    let heated_rock = mix(rock_darkened, vec3<f32>(0.15, 0.03, 0.01), edge_heat);
+
+    r.albedo = heated_rock;
+    r.emission = lava_col * heat * 3.5;
+    r.metallic = 0.0;
+    // Rock is rough, cracks are smooth (molten)
+    r.roughness = mix(rock.roughness, 0.1, crack);
+    r.alpha = 1.0;
+    // Rock bumps fade near cracks (molten areas are smooth)
+    r.normal = mix(rock.normal, n, crack * 0.7);
+    r.is_emissive_only = false;
+    return r;
+}
+
+// ── 16: Ice ──
+
+fn mat_ice(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResult {
+    var r: MaterialResult;
+    let view_dir = normalize(ep - wp);
+    let n_dot_v = max(dot(n, view_dir), 0.0);
+    let fresnel = pow(1.0 - n_dot_v, 4.0) * 0.6 + 0.1;
+
+    // Frost pattern using world normal
+    let p = n * 5.0;
+    let frost = simplex3d(p + vec3<f32>(t * 0.02)) * 0.5 + 0.5;
+    let frost2 = simplex3d(p * 3.0 + vec3<f32>(3.7, 1.2, 8.4)) * 0.5 + 0.5;
+    let frost_pattern = frost * 0.6 + frost2 * 0.4;
+
+    // SSS approximation — light scatters through blue ice
+    let sss = pow(1.0 - n_dot_v, 2.0) * 0.4;
+    let sss_color = vec3<f32>(0.3, 0.6, 0.9) * sss;
+
+    let base = mix(vec3<f32>(0.7, 0.85, 0.95), vec3<f32>(0.9, 0.95, 1.0), frost_pattern);
+
+    r.albedo = base;
+    r.emission = sss_color;
+    r.metallic = 0.1;
+    r.roughness = mix(0.05, 0.4, frost_pattern);
+    r.alpha = 1.0;
+    r.normal = n;
+    r.is_emissive_only = false;
+    return r;
+}
+
+// ── 17: Cloud (volumetric) ──
+
+fn cloud_density(p: vec3<f32>, t: f32) -> f32 {
+    let wind = vec3<f32>(t * 0.1, 0.0, t * 0.05);
+    let pp = p + wind;
+    let n1 = simplex3d(pp * 1.5) * 0.5;
+    let n2 = simplex3d(pp * 3.0 + vec3(5.2, 1.3, 2.8)) * 0.25;
+    let n3 = simplex3d(pp * 6.0 + vec3(1.7, 9.2, 4.1)) * 0.125;
+    let noise = n1 + n2 + n3;
+
+    let radial = length(p);
+    let shape = smoothstep(1.0, 0.3, radial);
+    return max((noise * 0.5 + 0.5) * shape - 0.2, 0.0) * 2.0;
+}
+
+fn mat_cloud(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let view_dir = normalize(wp - ep);
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - 1.0;
+    let disc = b * b - c_val;
+
+    if disc < 0.0 {
+        r.albedo = vec3(0.0); r.emission = vec3(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.9; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far = -b + sqrt_disc;
+
+    let steps = 32;
+    let step_size = (t_far - t_near) / f32(steps);
+    var transmittance = 1.0;
+    var accum = vec3<f32>(0.0);
+    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+    let cloud_col = vec3<f32>(0.95, 0.95, 0.97);
+    let shadow_col = vec3<f32>(0.4, 0.45, 0.55);
+
+    for (var i = 0; i < 32; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let local = ep + view_dir * ray_t - obj_center;
+        let d = cloud_density(local, t);
+        if d > 0.001 {
+            let ls = cloud_density(local + light_dir * 0.15, t);
+            let light_atten = exp(-ls * 3.0);
+            let lit = mix(shadow_col, cloud_col, light_atten);
+            accum += lit * d * step_size * transmittance * 4.0;
+            transmittance *= exp(-d * 5.0 * step_size);
+        }
+        if transmittance < 0.02 { break; }
+    }
 
     r.albedo = vec3(0.0);
-    r.emission = final_c * flicker;
+    r.emission = accum;
     r.metallic = 0.0;
-    r.roughness = 0.3;
-    r.alpha = clamp(total * 2.0 * flicker, 0.0, 1.0);
+    r.roughness = 0.9;
+    r.alpha = clamp((1.0 - transmittance) * 1.1, 0.0, 1.0);
     r.normal = n;
     r.is_emissive_only = true;
+    return r;
+}
+
+// ── 18: Explosion (volumetric) ──
+
+fn explosion_density(p: vec3<f32>, t: f32) -> vec2<f32> {
+    // Looping explosion: expand then fade
+    let phase = fract(t * 0.25);
+    let expand = 0.15 + phase * 0.8;
+    let fade = smoothstep(0.9, 1.0, phase);
+
+    // Scale position by expansion
+    let pp = p / max(expand, 0.01);
+
+    // Heavy turbulence — explosions are chaotic
+    let warp = vec3<f32>(
+        simplex3d(pp * 1.8 + vec3(t * 0.6, 0.0, 3.7)),
+        simplex3d(pp * 1.8 + vec3(0.0, t * 0.5, 7.1)),
+        simplex3d(pp * 1.8 + vec3(5.2, t * 0.4, 0.0))
+    );
+    let warped = pp + warp * 0.6;
+
+    // FBM noise
+    let n1 = simplex3d(warped * 1.5) * 0.5;
+    let n2 = simplex3d(warped * 3.0 + vec3(5.2, 1.3, 2.8)) * 0.25;
+    let n3 = simplex3d(warped * 6.0 + vec3(1.7, 9.2, 4.1)) * 0.12;
+    let n4 = simplex3d(warped * 12.0) * 0.06;
+    let noise = n1 + n2 + n3 + n4 + 0.5;
+
+    let radial = length(p);
+    // Mushroom shape: rises upward
+    let rise = p.y * 0.3; // upper part is denser
+    let shell = smoothstep(expand + 0.15, expand * 0.3, radial)
+              * (1.0 - fade);
+    let density = max(noise * shell - 0.08, 0.0) * 3.0;
+
+    // Temperature: hot core, cool edges, cools over time
+    let core_heat = exp(-radial * radial / (expand * expand) * 2.0);
+    let temp = core_heat * (1.0 - phase * 0.7) * noise;
+
+    return vec2(density, temp);
+}
+
+fn mat_explosion(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let view_dir = normalize(wp - ep);
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - 1.0;
+    let disc = b * b - c_val;
+
+    if disc < 0.0 {
+        r.albedo = vec3(0.0); r.emission = vec3(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.8; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far = -b + sqrt_disc;
+    let steps = 40;
+    let step_size = (t_far - t_near) / f32(steps);
+    var transmittance = 1.0;
+    var accum = vec3<f32>(0.0);
+
+    for (var i = 0; i < 40; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let local = ep + view_dir * ray_t - obj_center;
+        let dt = explosion_density(local, t);
+        let d = dt.x;
+        let temp = dt.y;
+        if d > 0.001 {
+            // Fire colors based on temperature
+            var col: vec3<f32>;
+            if temp > 0.8 { col = mix(vec3(1.0, 0.85, 0.3), vec3(1.0, 0.98, 0.9), (temp - 0.8) / 0.3); }
+            else if temp > 0.5 { col = mix(vec3(1.0, 0.4, 0.0), vec3(1.0, 0.85, 0.3), (temp - 0.5) / 0.3); }
+            else if temp > 0.2 { col = mix(vec3(0.6, 0.08, 0.0), vec3(1.0, 0.4, 0.0), (temp - 0.2) / 0.3); }
+            else {
+                // Cool = dark smoke
+                col = mix(vec3(0.03, 0.02, 0.02), vec3(0.6, 0.08, 0.0), temp / 0.2);
+            }
+
+            accum += col * d * step_size * transmittance * 5.0;
+            transmittance *= exp(-d * 7.0 * step_size);
+        }
+        if transmittance < 0.02 { break; }
+    }
+
+    // Flicker for liveliness
+    let flicker = 0.9 + 0.1 * sin(t * 20.0) * sin(t * 13.0 + 2.1);
+    accum *= flicker;
+
+    r.albedo = vec3(0.0);
+    r.emission = accum;
+    r.metallic = 0.0;
+    r.roughness = 0.8;
+    r.alpha = clamp((1.0 - transmittance) * 1.1, 0.0, 1.0);
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
+// ── 19: Tornado (volumetric) ──
+
+fn tornado_density(p: vec3<f32>, t: f32) -> f32 {
+    let height = (p.y + 1.0) * 0.5; // 0=bottom, 1=top
+    let radial = length(vec2(p.x, p.z));
+    let angle_val = atan2(p.z, p.x);
+
+    // Funnel: wide at bottom (ground), narrow at top (cloud)
+    let funnel_r = mix(0.6, 0.06, pow(height, 1.5));
+
+    // Spiraling twist — increases with height
+    let twist_speed = t * 4.0;
+    let twist = angle_val + twist_speed + height * 12.0;
+
+    // Multiple spiral arms with noise
+    let arm1 = sin(twist * 2.0) * 0.5 + 0.5;
+    let arm2 = sin(twist * 3.0 + 2.0) * 0.5 + 0.5;
+    let spiral = max(arm1, arm2);
+
+    // Distance from funnel wall
+    let wall_dist = abs(radial - funnel_r);
+    let wall_thick = 0.08 + spiral * 0.12;
+    let wall = exp(-wall_dist * wall_dist / (wall_thick * wall_thick));
+
+    // Inner debris/dust
+    let inner = smoothstep(funnel_r, funnel_r * 0.2, radial) * 0.3;
+
+    // Rising debris noise
+    let debris = simplex3d(vec3(p.x * 5.0, p.y * 3.0 - t * 3.0, p.z * 5.0)) * 0.5 + 0.5;
+    let debris2 = simplex3d(vec3(p.x * 10.0, p.y * 6.0 - t * 5.0, p.z * 10.0)) * 0.3;
+
+    // Edge noise to break up the shape
+    let edge_noise = simplex3d(vec3(p.x * 3.0, p.y * 2.0 - t * 2.0, p.z * 3.0)) * 0.15;
+
+    let shape = smoothstep(-0.05, 0.08, height) * smoothstep(1.05, 0.85, height);
+    let density = (wall + inner) * (debris + 0.4 + debris2) * shape;
+
+    return max(density + edge_noise - 0.1, 0.0) * 2.0;
+}
+
+fn mat_tornado(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let view_dir = normalize(wp - ep);
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - 1.0;
+    let disc = b * b - c_val;
+
+    if disc < 0.0 {
+        r.albedo = vec3(0.0); r.emission = vec3(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.7; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far = -b + sqrt_disc;
+    let steps = 32;
+    let step_size = (t_far - t_near) / f32(steps);
+    var transmittance = 1.0;
+    var accum = vec3<f32>(0.0);
+    let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
+    let dust_col = vec3<f32>(0.35, 0.3, 0.25);
+    let dark_col = vec3<f32>(0.15, 0.12, 0.1);
+
+    for (var i = 0; i < 32; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let local = ep + view_dir * ray_t - obj_center;
+        let d = tornado_density(local, t);
+        if d > 0.001 {
+            let ls = tornado_density(local + light_dir * 0.12, t);
+            let light_atten = exp(-ls * 2.0);
+            let lit = mix(dark_col, dust_col, light_atten);
+            accum += lit * d * step_size * transmittance * 4.0;
+            transmittance *= exp(-d * 5.0 * step_size);
+        }
+        if transmittance < 0.02 { break; }
+    }
+
+    r.albedo = vec3(0.0);
+    r.emission = accum;
+    r.metallic = 0.0;
+    r.roughness = 0.7;
+    r.alpha = clamp((1.0 - transmittance) * 1.0, 0.0, 1.0);
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
+// ── 20: Skin (SSS) ──
+
+fn mat_skin(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResult {
+    var r: MaterialResult;
+    let view_dir = normalize(ep - wp);
+    let n_dot_v = max(dot(n, view_dir), 0.0);
+
+    // Subtle pore texture
+    let p = n * 15.0;
+    let pore = simplex3d(p) * 0.3 + simplex3d(p * 3.0) * 0.15;
+    let pore_rough = 0.35 + pore * 0.15;
+
+    // SSS: light wraps around edges
+    let sss_wrap = pow(1.0 - n_dot_v, 2.5);
+    let sss_color = vec3<f32>(0.8, 0.2, 0.1) * sss_wrap * 0.35;
+
+    // Base skin color with slight variation
+    let variation = simplex3d(n * 4.0 + vec3(2.1, 5.3, 7.7)) * 0.05;
+    let base = vec3<f32>(0.82 + variation, 0.62 + variation * 0.5, 0.48 + variation * 0.3);
+
+    r.albedo = base;
+    r.emission = sss_color;
+    r.metallic = 0.0;
+    r.roughness = pore_rough;
+    r.alpha = 1.0;
+    r.normal = n;
+    r.is_emissive_only = false;
     return r;
 }
 
@@ -1293,8 +1900,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let wp = in.world_position;
     let ep = camera.position.xyz;
     let t = camera.position.w;  // time encoded in position.w
-    let wn = normalize(in.world_normal);
+    let raw_normal = normalize(in.world_normal);
     let uv = in.uv;
+
+    // Landscape mode: material.w > 0.5 means huge sphere (planet surface)
+    // Normal is valid but we need to use world position for texture tiling
+    let is_landscape = in.material.w > 0.5;
+    var wn: vec3<f32>;
+    if is_landscape {
+        // Use world position for pattern generation (tiles across surface)
+        wn = normalize(vec3<f32>(wp.x * 0.3, wp.z * 0.3, wp.y * 0.3 + 0.5));
+    } else {
+        wn = raw_normal;
+    }
 
     // Material kind from instance data
     let k = u32(in.material.z + 0.5);
@@ -1306,17 +1924,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         case 2u:  { mat = mat_portal(wp, wn, ep, t, uv); }
         case 3u:  { mat = mat_grid(wp, wn, ep, t, uv); }
         case 4u:  { mat = mat_water(wp, wn, ep, t); }
-        case 5u:  { mat = mat_fire(wp, wn, ep, t, uv); }
-        case 6u:  { mat = mat_smoke(wp, wn, ep, t, uv); }
+        case 5u:  { mat = mat_fire(wp, wn, ep, t, in.object_center); }
+        case 6u:  { mat = mat_smoke(wp, wn, ep, t, in.object_center); }
         case 7u:  { mat = mat_aurora(wp, wn, ep, t, uv); }
         case 8u:  { mat = mat_hologram(wp, wn, ep, t, uv); }
         case 9u:  { mat = mat_crystal(wp, wn, ep, t); }
         case 10u: { mat = mat_metal(wp, wn, ep, t); }
         case 11u: { mat = mat_neon(wp, wn, ep, t, uv); }
         case 12u: { mat = mat_shield(wp, wn, ep, t); }
-        case 13u: { mat = mat_warp(wp, wn, ep, t, uv); }
-        case 14u: { mat = mat_dissolve(wp, wn, ep, t, uv); }
-        case 15u: { mat = mat_lightning(wp, wn, ep, t, uv); }
+        case 13u: { mat = mat_dissolve(wp, wn, ep, t, uv); }
+        case 14u: { mat = mat_lightning(wp, wn, ep, t, in.object_center); }
+        case 15u: { mat = mat_lava(wp, wn, ep, t); }
+        case 16u: { mat = mat_ice(wp, wn, ep, t); }
+        case 17u: { mat = mat_cloud(wp, wn, ep, t, in.object_center); }
+        case 18u: { mat = mat_explosion(wp, wn, ep, t, in.object_center); }
+        case 19u: { mat = mat_tornado(wp, wn, ep, t, in.object_center); }
+        case 20u: { mat = mat_skin(wp, wn, ep, t); }
+        case 21u: { mat = mat_rock(wp, wn, ep, t); }
         default:  { mat = mat_metal(wp, wn, ep, t); }
     }
 
@@ -1329,6 +1953,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Use instance-provided PBR params, blended with procedural
         mat.metallic = max(mat.metallic, in.material.x);
         mat.roughness = clamp(mix(mat.roughness, in.material.y, 0.5), 0.04, 1.0);
+    }
+
+    // Landscape mode: restore real surface normal for lighting
+    if is_landscape {
+        mat.normal = raw_normal;
     }
 
     // Apply PBR lighting
