@@ -3,25 +3,16 @@ use sabitori::*;
 use sabitori_widgets::SliderState;
 use seimei::procedural;
 use seimei::quality::{MsaaSamples, QualityPreset, QualitySettings, ShadowQuality};
-use seimei::{GpuVertex, InstanceData, Renderer};
+use seimei::{CameraUniform, InstanceData, Light, LightUniform, Renderer};
+use murakumo::{
+    MaterialPass, MaterialDraw, LayerInstance, MATERIAL_COUNT, MATERIAL_NAMES,
+    material_params, PARAMS_PER_MATERIAL,
+};
 use web_time::Instant;
 use wgpu::util::DeviceExt;
 
-mod params;
-use params::{material_params, PARAMS_PER_MATERIAL};
-
 // ── Constants ──
 
-const MATERIAL_NAMES: [&str; 23] = [
-    "Bubble", "Glass", "Portal", "Grid",
-    "Water", "Fire", "Smoke", "Aurora",
-    "Hologram", "Crystal", "Metal", "Neon",
-    "Shield", "Dissolve", "Lightning", "Lava",
-    "Ice", "Cloud", "Explosion", "Tornado",
-    "Skin", "Rock", "Field",
-];
-
-const MATERIAL_COUNT: usize = 23;
 const GRID_COLS: usize = 8;
 const GRID_ROWS: usize = 3;
 const SPACING: f32 = 1.8;
@@ -38,41 +29,7 @@ struct BgCameraUniform {
     time: f32,
 }
 
-// ── PBR Camera uniform (matches shader CameraUniform) ──
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct PbrCameraUniform {
-    view_proj: [[f32; 4]; 4],
-    view: [[f32; 4]; 4],
-    position: [f32; 4], // xyz = eye, w = time
-    clip_min: [f32; 4],
-    clip_max: [f32; 4],
-}
-
-// ── Material params uniform (matches shader MatParamsUniform) ──
-//
-// Layout: 23 materials × 2 vec4 = 46 vec4 (= 184 floats / 736 bytes).
-
-const MAT_PARAMS_VEC4S: usize = MATERIAL_COUNT * 2;
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct MatParamsUniform {
-    values: [[f32; 4]; MAT_PARAMS_VEC4S],
-}
-
-impl MatParamsUniform {
-    fn from_values(per_mat: &[[f32; PARAMS_PER_MATERIAL]; MATERIAL_COUNT]) -> Self {
-        let mut out = Self { values: [[0.0; 4]; MAT_PARAMS_VEC4S] };
-        for k in 0..MATERIAL_COUNT {
-            let p = &per_mat[k];
-            out.values[k * 2]     = [p[0], p[1], p[2], p[3]];
-            out.values[k * 2 + 1] = [p[4], p[5], p[6], p[7]];
-        }
-        out
-    }
-}
+// PbrCameraUniform, LayerInstance, MatParamsUniform — moved to murakumo crate
 
 // ── Background pass resources ──
 
@@ -201,370 +158,7 @@ impl BackgroundPass {
     }
 }
 
-// ── Custom PBR Material Pipeline ──
-// Uses our pbr_material.wgsl with Seimei's bind group layout (for reusing buffers)
-
-struct PbrMaterialPass {
-    pipeline: wgpu::RenderPipeline,
-    transparent_pipeline: wgpu::RenderPipeline, // No depth write for transparent materials
-    // Group 0: Camera (with time in position.w)
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
-    // Group 1: Lights
-    light_buffer: wgpu::Buffer,
-    light_bind_group: wgpu::BindGroup,
-    // Group 2: Texture (dummy white)
-    texture_bind_group: wgpu::BindGroup,
-    // Group 3: Shadow
-    shadow_bind_group: wgpu::BindGroup,
-    shadow_light_vp_buffer: wgpu::Buffer,
-    // Per-material tunable parameters (Group 1, binding 1)
-    mat_params_buffer: wgpu::Buffer,
-    // Instance buffer
-    instance_buffer: wgpu::Buffer,
-}
-
-fn is_transparent_material(index: usize) -> bool {
-    // Bubble, Glass, Fire, Smoke, Lightning, Cloud, Explosion, Tornado
-    matches!(index, 0 | 1 | 5 | 6 | 14 | 17 | 18 | 19)
-}
-
-impl PbrMaterialPass {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::TextureFormat) -> Self {
-        let shader_src = include_str!("../shaders/pbr_material.wgsl");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pbr_material_shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
-
-        // Group 0: Camera
-        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pbr_camera_buffer"),
-            size: std::mem::size_of::<PbrCameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pbr_camera_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pbr_camera_bg"),
-            layout: &camera_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
-
-        // Group 1: Lights
-        // LightUniform: ambient_and_count(16) + 8 * GpuLight(48) = 400 bytes
-        let light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pbr_light_buffer"),
-            size: 400,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        // Material params buffer (binding 1 of group 1 — co-located with lights
-        // to stay within the default `max_bind_groups: 4` limit)
-        let mat_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pbr_mat_params_buffer"),
-            size: std::mem::size_of::<MatParamsUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let light_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pbr_light_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let light_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pbr_light_bg"),
-            layout: &light_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: light_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: mat_params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Group 2: Texture (1x1 white)
-        let white_data = [255u8, 255, 255, 255];
-        let tex = device.create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
-                label: Some("pbr_white_tex"),
-                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &white_data,
-        );
-        let tex_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let tex_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("pbr_tex_sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pbr_texture_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let texture_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pbr_texture_bg"),
-            layout: &texture_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&tex_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&tex_sampler),
-                },
-            ],
-        });
-
-        // Group 3: Shadow
-        let shadow_size = 2048u32;
-        let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("pbr_shadow_tex"),
-            size: wgpu::Extent3d { width: shadow_size, height: shadow_size, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let shadow_view = shadow_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("pbr_shadow_sampler"),
-            compare: Some(wgpu::CompareFunction::LessEqual),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let shadow_light_vp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pbr_shadow_lvp"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pbr_shadow_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Depth,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let shadow_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pbr_shadow_bg"),
-            layout: &shadow_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: shadow_light_vp_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Pipeline layout
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pbr_material_pipeline_layout"),
-            bind_group_layouts: &[&camera_bgl, &light_bgl, &texture_bgl, &shadow_bgl],
-            push_constant_ranges: &[],
-        });
-
-        // Instance buffer
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pbr_instance_buffer"),
-            size: (std::mem::size_of::<InstanceData>() * MATERIAL_COUNT) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Opaque pipeline: depth write ON, backface culling ON
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pbr_material_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[GpuVertex::layout(), InstanceData::layout()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        // Transparent pipeline: NO depth write, NO backface cull
-        let transparent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pbr_transparent_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[GpuVertex::layout(), InstanceData::layout()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back), // Cull back — shader simulates both surfaces
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false, // Don't write depth — back faces must be visible
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        Self {
-            pipeline,
-            transparent_pipeline,
-            camera_buffer,
-            camera_bind_group: camera_bg,
-            light_buffer,
-            light_bind_group: light_bg,
-            texture_bind_group: texture_bg,
-            shadow_bind_group: shadow_bg,
-            shadow_light_vp_buffer,
-            mat_params_buffer,
-            instance_buffer,
-        }
-    }
-}
+// PbrMaterialPass — replaced by murakumo::MaterialPass
 
 // ── Orbit Camera ──
 
@@ -767,22 +361,7 @@ fn build_instance(mat_idx: usize, time: f32) -> InstanceData {
     }
 }
 
-// ── Light Uniform (matches shader LightUniform) ──
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuLightData {
-    direction_or_position_and_type: [f32; 4],
-    color_and_intensity: [f32; 4],
-    extra: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct LightUniformData {
-    ambient_and_count: [f32; 4],
-    lights: [GpuLightData; 8],
-}
+// Light types — now using seimei::LightUniform directly
 
 // ── Gallery App ──
 
@@ -797,7 +376,7 @@ enum GalleryState {
 struct GalleryApp {
     camera: OrbitCamera,
     renderer: Option<Renderer>,
-    pbr_pass: Option<PbrMaterialPass>,
+    mat_pass: Option<MaterialPass>,
     bg_pass: Option<BackgroundPass>,
     time: f32,
     start: Instant,
@@ -813,8 +392,25 @@ struct GalleryApp {
     // Per-material tunable params + slider widgets (one per material × param)
     material_param_values: Vec<[f32; PARAMS_PER_MATERIAL]>,
     material_sliders: Vec<Vec<SliderState>>,
-    /// (material_idx, param_idx) currently being dragged
-    dragging_slider: Option<(usize, usize)>,
+    /// What secondary material to overlay when this material is shown in detail.
+    /// `None` = no second layer.
+    material_layer2: Vec<Option<usize>>,
+    /// Alpha mix for the secondary layer per material (0..1).
+    material_layer2_alpha: Vec<f32>,
+    /// Slider state for the layer2 alpha row (one per material).
+    material_layer2_alpha_sliders: Vec<SliderState>,
+    /// Drag target: identifies which slider is being dragged.
+    /// `Slot::Primary(mat_idx, param_idx)` — a primary-material param.
+    /// `Slot::Secondary(layer2_kind, param_idx)` — a secondary-layer param (uses layer2 kind's slot).
+    /// `Slot::LayerAlpha(mat_idx)` — the layer-2 alpha mix slider.
+    dragging_slider: Option<DragSlot>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DragSlot {
+    Primary(usize, usize),
+    Secondary(usize, usize),
+    LayerAlpha(usize),
 }
 
 // ── Parameter drawer layout (detail mode) ──
@@ -925,7 +521,7 @@ impl GalleryApp {
         let mut material_param_values = Vec::with_capacity(MATERIAL_COUNT);
         let mut material_sliders = Vec::with_capacity(MATERIAL_COUNT);
         for k in 0..MATERIAL_COUNT {
-            let defaults = params::default_values(k);
+            let defaults = murakumo::default_values(k);
             material_param_values.push(defaults);
             let specs = material_params(k);
             let sliders: Vec<SliderState> = specs
@@ -939,7 +535,7 @@ impl GalleryApp {
         Self {
             camera: OrbitCamera::new(),
             renderer: None,
-            pbr_pass: None,
+            mat_pass: None,
             bg_pass: None,
             time: 0.0,
             start: Instant::now(),
@@ -953,6 +549,11 @@ impl GalleryApp {
             click_pos: (0.0, 0.0),
             material_param_values,
             material_sliders,
+            material_layer2: vec![None; MATERIAL_COUNT],
+            material_layer2_alpha: vec![0.7; MATERIAL_COUNT],
+            material_layer2_alpha_sliders: (0..MATERIAL_COUNT)
+                .map(|_| SliderState::from_ranged(0.7, 0.0, 1.0))
+                .collect(),
             dragging_slider: None,
         }
     }
@@ -972,51 +573,214 @@ impl GalleryApp {
         if material_idx == FIELD_INDEX { 21 } else { material_idx }
     }
 
-    /// Track screen-space `Rect` for the i-th param of the active material.
-    /// Returns `(track_x, track_y, track_w, track_h)`.
-    fn slider_track_xywh(&self, param_idx: usize) -> (f32, f32, f32, f32) {
-        let drawer_x = self.width - DRAWER_W - DRAWER_RIGHT_MARGIN;
-        let track_x = drawer_x + DRAWER_PAD + SLIDER_LABEL_W + SLIDER_GAP;
-        let row_top = DRAWER_TOP + DRAWER_PAD + DRAWER_TITLE_H + DRAWER_TITLE_GAP
-            + (param_idx as f32) * SLIDER_ROW_STRIDE;
-        // Track itself is centered vertically inside the 24px row, but we treat
-        // the whole row band as the hit zone for ergonomics.
-        (track_x, row_top, SLIDER_TRACK_W, SLIDER_ROW_H)
+    /// Drawer row layout for the given primary material. Returns the ordered
+    /// list of rows (uniform stride). Used by both `view()` and hit-testing
+    /// so they stay in sync.
+    fn drawer_rows(&self, mat_idx: usize) -> Vec<DrawerRow> {
+        let mut rows: Vec<DrawerRow> = Vec::new();
+        let primary_specs = material_params(mat_idx);
+        for i in 0..primary_specs.len() {
+            rows.push(DrawerRow::Primary(i));
+        }
+        rows.push(DrawerRow::LayerCycle); // toggle / cycle button
+        if let Some(kind2) = self.material_layer2[mat_idx] {
+            rows.push(DrawerRow::LayerAlpha);
+            let secondary_specs = material_params(kind2);
+            for i in 0..secondary_specs.len() {
+                rows.push(DrawerRow::Secondary(kind2, i));
+            }
+        }
+        rows
     }
 
-    /// Hit-test the entire drawer row band (not just the visible 4px track),
-    /// matching what the user sees as a clickable line.
-    fn slider_hit_test(&self, mat_idx: usize, mouse: (f32, f32)) -> Option<usize> {
-        let n = material_params(mat_idx).len();
-        if n == 0 {
+    fn drawer_row_y(&self, row_idx: usize) -> f32 {
+        DRAWER_TOP + DRAWER_PAD + DRAWER_TITLE_H + DRAWER_TITLE_GAP
+            + (row_idx as f32) * SLIDER_ROW_STRIDE
+    }
+
+    fn slider_track_x(&self) -> f32 {
+        let drawer_x = self.width - DRAWER_W - DRAWER_RIGHT_MARGIN;
+        drawer_x + DRAWER_PAD + SLIDER_LABEL_W + SLIDER_GAP
+    }
+
+    /// Hit-test the entire drawer; returns what was clicked.
+    fn drawer_hit_test(&self, mat_idx: usize, mouse: (f32, f32)) -> Option<DrawerHit> {
+        let drawer_x = self.width - DRAWER_W - DRAWER_RIGHT_MARGIN;
+        let row_left = drawer_x + DRAWER_PAD;
+        let row_w = DRAWER_W - DRAWER_PAD * 2.0;
+        if mouse.0 < row_left || mouse.0 > row_left + row_w {
             return None;
         }
-        let drawer_x = self.width - DRAWER_W - DRAWER_RIGHT_MARGIN;
-        let row_left = drawer_x + DRAWER_PAD + SLIDER_LABEL_W + SLIDER_GAP;
-        let row_w = SLIDER_TRACK_W + SLIDER_GAP + SLIDER_VALUE_W;
-        for i in 0..n {
-            let (_, ty, _, _) = self.slider_track_xywh(i);
-            if mouse.0 >= row_left
-                && mouse.0 <= row_left + row_w
-                && mouse.1 >= ty
-                && mouse.1 <= ty + SLIDER_ROW_H
-            {
-                return Some(i);
+        for (i, row) in self.drawer_rows(mat_idx).into_iter().enumerate() {
+            let ty = self.drawer_row_y(i);
+            if mouse.1 < ty || mouse.1 > ty + SLIDER_ROW_H {
+                continue;
+            }
+            return Some(match row {
+                DrawerRow::Primary(p) => DrawerHit::Slider(DragSlot::Primary(mat_idx, p)),
+                DrawerRow::LayerCycle => DrawerHit::CycleLayer,
+                DrawerRow::LayerAlpha => DrawerHit::Slider(DragSlot::LayerAlpha(mat_idx)),
+                DrawerRow::Secondary(k2, p) => DrawerHit::Slider(DragSlot::Secondary(k2, p)),
+            });
+        }
+        None
+    }
+
+    /// Track screen-space `(x, y, w, h)` for the slider in this drag slot,
+    /// based on its current row position.
+    fn slot_track_xywh(&self, slot: DragSlot) -> Option<(f32, f32, f32, f32)> {
+        let mat_idx = self.drawer_material()?;
+        for (i, row) in self.drawer_rows(mat_idx).into_iter().enumerate() {
+            let matches = match (row, slot) {
+                (DrawerRow::Primary(p), DragSlot::Primary(_, sp)) => p == sp,
+                (DrawerRow::LayerAlpha, DragSlot::LayerAlpha(_)) => true,
+                (DrawerRow::Secondary(rk, rp), DragSlot::Secondary(sk, sp)) => rk == sk && rp == sp,
+                _ => false,
+            };
+            if matches {
+                return Some((self.slider_track_x(), self.drawer_row_y(i), SLIDER_TRACK_W, SLIDER_ROW_H));
             }
         }
         None
     }
 
-    /// Apply the slider's normalized value back to the per-material float array.
-    fn sync_value_from_slider(&mut self, mat_idx: usize, param_idx: usize) {
-        let spec = match material_params(mat_idx).get(param_idx) {
-            Some(s) => *s,
+    /// Begin dragging a slider slot, snapping value to the press location.
+    fn begin_slot_drag(&mut self, slot: DragSlot, mouse_x: f32) {
+        let (tx, _, tw, _) = match self.slot_track_xywh(slot) {
+            Some(v) => v,
             None => return,
         };
-        let storage = Self::storage_index(mat_idx);
-        let v = self.material_sliders[storage][param_idx].ranged(spec.min, spec.max);
-        self.material_param_values[storage][param_idx] = v;
+        match slot {
+            DragSlot::Primary(mat_idx, _) => {
+                let storage = Self::storage_index(mat_idx);
+                if let DragSlot::Primary(_, p) = slot {
+                    if let Some(s) = self.material_sliders[storage].get_mut(p) {
+                        s.begin_drag(mouse_x, tx, tw);
+                    }
+                }
+            }
+            DragSlot::Secondary(k2, p) => {
+                let storage = Self::storage_index(k2);
+                if let Some(s) = self.material_sliders[storage].get_mut(p) {
+                    s.begin_drag(mouse_x, tx, tw);
+                }
+            }
+            DragSlot::LayerAlpha(mat_idx) => {
+                self.material_layer2_alpha_sliders[mat_idx].begin_drag(mouse_x, tx, tw);
+            }
+        }
+        self.sync_value_for_slot(slot);
     }
+
+    fn drag_slot_to(&mut self, slot: DragSlot, mouse_x: f32) {
+        let (tx, _, tw, _) = match self.slot_track_xywh(slot) {
+            Some(v) => v,
+            None => return,
+        };
+        match slot {
+            DragSlot::Primary(mat_idx, p) => {
+                let storage = Self::storage_index(mat_idx);
+                if let Some(s) = self.material_sliders[storage].get_mut(p) {
+                    s.drag_to(mouse_x, tx, tw);
+                }
+            }
+            DragSlot::Secondary(k2, p) => {
+                let storage = Self::storage_index(k2);
+                if let Some(s) = self.material_sliders[storage].get_mut(p) {
+                    s.drag_to(mouse_x, tx, tw);
+                }
+            }
+            DragSlot::LayerAlpha(mat_idx) => {
+                self.material_layer2_alpha_sliders[mat_idx].drag_to(mouse_x, tx, tw);
+            }
+        }
+        self.sync_value_for_slot(slot);
+    }
+
+    fn end_slot_drag(&mut self, slot: DragSlot) {
+        match slot {
+            DragSlot::Primary(mat_idx, p) => {
+                let storage = Self::storage_index(mat_idx);
+                if let Some(s) = self.material_sliders[storage].get_mut(p) {
+                    s.end_drag();
+                }
+            }
+            DragSlot::Secondary(k2, p) => {
+                let storage = Self::storage_index(k2);
+                if let Some(s) = self.material_sliders[storage].get_mut(p) {
+                    s.end_drag();
+                }
+            }
+            DragSlot::LayerAlpha(mat_idx) => {
+                self.material_layer2_alpha_sliders[mat_idx].end_drag();
+            }
+        }
+    }
+
+    fn sync_value_for_slot(&mut self, slot: DragSlot) {
+        match slot {
+            DragSlot::Primary(mat_idx, p) => {
+                let spec = match material_params(mat_idx).get(p) {
+                    Some(s) => *s,
+                    None => return,
+                };
+                let storage = Self::storage_index(mat_idx);
+                let v = self.material_sliders[storage][p].ranged(spec.min, spec.max);
+                self.material_param_values[storage][p] = v;
+            }
+            DragSlot::Secondary(k2, p) => {
+                let spec = match material_params(k2).get(p) {
+                    Some(s) => *s,
+                    None => return,
+                };
+                let storage = Self::storage_index(k2);
+                let v = self.material_sliders[storage][p].ranged(spec.min, spec.max);
+                self.material_param_values[storage][p] = v;
+            }
+            DragSlot::LayerAlpha(mat_idx) => {
+                self.material_layer2_alpha[mat_idx] =
+                    self.material_layer2_alpha_sliders[mat_idx].value();
+            }
+        }
+    }
+
+    /// Cycle the layer 2 selection: None → 0 → 1 → ... → MATERIAL_COUNT-1 → None.
+    /// Skips the primary material itself (no Self+Self combos).
+    fn cycle_layer2(&mut self, mat_idx: usize) {
+        let next = match self.material_layer2[mat_idx] {
+            None => Some(0),
+            Some(k) => {
+                let mut next = k + 1;
+                if next == mat_idx { next += 1; }
+                if next >= MATERIAL_COUNT { None } else { Some(next) }
+            }
+        };
+        // If next == mat_idx after wrap-around, skip
+        let next = match next {
+            Some(k) if k == mat_idx => {
+                if k + 1 >= MATERIAL_COUNT { None } else { Some(k + 1) }
+            }
+            other => other,
+        };
+        self.material_layer2[mat_idx] = next;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DrawerRow {
+    Primary(usize),         // param_idx within primary material
+    LayerCycle,             // layer 2 toggle / cycle button
+    LayerAlpha,             // alpha slider for layer 2
+    Secondary(usize, usize),// (layer2_kind, param_idx)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DrawerHit {
+    Slider(DragSlot),
+    CycleLayer,
+}
+
+impl GalleryApp {
 
     /// Hit-test: find which material grid cell was clicked
     fn hit_test_grid(&self, screen_x: f32, screen_y: f32) -> Option<usize> {
@@ -1169,15 +933,15 @@ impl DeclarativeApp for GalleryApp {
             children.push(div().pos(20.0, ctx.height - 24.0).child(esc));
 
             // ── Param drawer (right side) ──
-            // Shown for any material that has tunable params, both during and
-            // after the transition (so it pops in alongside the detail UI).
-            let specs = material_params(idx);
-            if !specs.is_empty() {
+            // Lays out one row per `DrawerRow` returned by `drawer_rows()`,
+            // so view + hit-testing stay in lockstep.
+            let drawer_rows = self.drawer_rows(idx);
+            if !drawer_rows.is_empty() {
                 let drawer_x = ctx.width - DRAWER_W - DRAWER_RIGHT_MARGIN;
                 let drawer_h = DRAWER_PAD * 2.0
                     + DRAWER_TITLE_H
                     + DRAWER_TITLE_GAP
-                    + (specs.len() as f32) * SLIDER_ROW_STRIDE
+                    + (drawer_rows.len() as f32) * SLIDER_ROW_STRIDE
                     - (SLIDER_ROW_STRIDE - SLIDER_ROW_H);
 
                 // Background panel
@@ -1206,39 +970,81 @@ impl DeclarativeApp for GalleryApp {
                         ),
                 );
 
-                // Sliders
                 let track_color = Color::new(0.2, 0.25, 0.35, 0.85);
                 let fill_color = Color::new(0.55, 0.75, 1.0, 1.0);
                 let knob_color = Color::new(0.9, 0.95, 1.0, 1.0);
                 let text_color = Color::new(0.78, 0.85, 0.95, 0.95);
-                let storage = Self::storage_index(idx);
-                for (i, spec) in specs.iter().enumerate() {
-                    let row_y = DRAWER_TOP + DRAWER_PAD + DRAWER_TITLE_H + DRAWER_TITLE_GAP
-                        + (i as f32) * SLIDER_ROW_STRIDE;
-                    let value = self.material_param_values[storage][i];
-                    let norm = self.material_sliders[storage][i].value();
-                    let id = format!("slider-{}-{}", idx, i);
-                    let row_w = SLIDER_LABEL_W + SLIDER_TRACK_W + SLIDER_VALUE_W + SLIDER_GAP * 2.0;
-                    let row = labeled_slider(
-                        &id,
-                        spec.name,
-                        &format_value(value),
-                        norm,
-                        SLIDER_LABEL_W,
-                        SLIDER_TRACK_W,
-                        SLIDER_VALUE_W,
-                        text_color,
-                        track_color,
-                        fill_color,
-                        knob_color,
-                    );
-                    children.push(
-                        div()
-                            .pos(drawer_x + DRAWER_PAD, row_y)
-                            .w(Px(row_w))
-                            .h(Px(SLIDER_ROW_H))
-                            .child(row),
-                    );
+                let dim_text = Color::new(0.6, 0.7, 0.85, 0.85);
+                let row_w = SLIDER_LABEL_W + SLIDER_TRACK_W + SLIDER_VALUE_W + SLIDER_GAP * 2.0;
+                let primary_storage = Self::storage_index(idx);
+
+                for (i, row) in drawer_rows.iter().enumerate() {
+                    let row_y = self.drawer_row_y(i);
+                    let row_x = drawer_x + DRAWER_PAD;
+                    match row {
+                        DrawerRow::Primary(p) => {
+                            let spec = material_params(idx)[*p];
+                            let value = self.material_param_values[primary_storage][*p];
+                            let norm = self.material_sliders[primary_storage][*p].value();
+                            let id = format!("p-{}-{}", idx, p);
+                            let r = labeled_slider(
+                                &id, spec.name, &format_value(value), norm,
+                                SLIDER_LABEL_W, SLIDER_TRACK_W, SLIDER_VALUE_W,
+                                text_color, track_color, fill_color, knob_color,
+                            );
+                            children.push(
+                                div().pos(row_x, row_y).w(Px(row_w)).h(Px(SLIDER_ROW_H)).child(r),
+                            );
+                        }
+                        DrawerRow::LayerCycle => {
+                            let label = match self.material_layer2[idx] {
+                                None => "Layer 2:  none  \u{25B6}".to_string(),
+                                Some(k2) => format!("Layer 2:  {}  \u{25B6}", MATERIAL_NAMES[k2]),
+                            };
+                            children.push(
+                                div()
+                                    .pos(row_x, row_y)
+                                    .w(Px(row_w))
+                                    .h(Px(SLIDER_ROW_H))
+                                    .bg(Color::new(0.1, 0.13, 0.2, 0.6))
+                                    .rounded_px(4.0)
+                                    .child(
+                                        text(label)
+                                            .mono()
+                                            .font_size(12.0)
+                                            .color(dim_text),
+                                    ),
+                            );
+                        }
+                        DrawerRow::LayerAlpha => {
+                            let value = self.material_layer2_alpha[idx];
+                            let norm = self.material_layer2_alpha_sliders[idx].value();
+                            let id = format!("a-{}", idx);
+                            let r = labeled_slider(
+                                &id, "Mix", &format_value(value), norm,
+                                SLIDER_LABEL_W, SLIDER_TRACK_W, SLIDER_VALUE_W,
+                                text_color, track_color, fill_color, knob_color,
+                            );
+                            children.push(
+                                div().pos(row_x, row_y).w(Px(row_w)).h(Px(SLIDER_ROW_H)).child(r),
+                            );
+                        }
+                        DrawerRow::Secondary(k2, p) => {
+                            let spec = material_params(*k2)[*p];
+                            let storage = Self::storage_index(*k2);
+                            let value = self.material_param_values[storage][*p];
+                            let norm = self.material_sliders[storage][*p].value();
+                            let id = format!("s-{}-{}-{}", idx, k2, p);
+                            let r = labeled_slider(
+                                &id, spec.name, &format_value(value), norm,
+                                SLIDER_LABEL_W, SLIDER_TRACK_W, SLIDER_VALUE_W,
+                                dim_text, track_color, fill_color, knob_color,
+                            );
+                            children.push(
+                                div().pos(row_x, row_y).w(Px(row_w)).h(Px(SLIDER_ROW_H)).child(r),
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -1307,20 +1113,21 @@ impl DeclarativeApp for GalleryApp {
 
     fn on_input(&mut self, event: &InputEvent) -> bool {
         match event {
-            InputEvent::PointerPressed { position, button } => {
-                if *button == MouseButton::Left {
-                    // Slider hit (drawer takes priority over orbit camera)
+            InputEvent::PointerPressed { position, button, .. } => {
+                if *button == Some(MouseButton::Left) {
+                    // Drawer hit (sliders + cycle button) takes priority over orbit camera
                     if let Some(mat_idx) = self.drawer_material() {
-                        if let Some(param_idx) =
-                            self.slider_hit_test(mat_idx, (position.x, position.y))
-                        {
-                            let (tx, _, tw, _) = self.slider_track_xywh(param_idx);
-                            let storage = Self::storage_index(mat_idx);
-                            self.material_sliders[storage][param_idx]
-                                .begin_drag(position.x, tx, tw);
-                            self.sync_value_from_slider(mat_idx, param_idx);
-                            self.dragging_slider = Some((mat_idx, param_idx));
-                            return true;
+                        match self.drawer_hit_test(mat_idx, (position.x, position.y)) {
+                            Some(DrawerHit::Slider(slot)) => {
+                                self.begin_slot_drag(slot, position.x);
+                                self.dragging_slider = Some(slot);
+                                return true;
+                            }
+                            Some(DrawerHit::CycleLayer) => {
+                                self.cycle_layer2(mat_idx);
+                                return true;
+                            }
+                            None => {}
                         }
                     }
                     self.drag_distance = 0.0;
@@ -1329,11 +1136,10 @@ impl DeclarativeApp for GalleryApp {
                     return true;
                 }
             }
-            InputEvent::PointerReleased { position, button } => {
-                if *button == MouseButton::Left {
-                    if let Some((mat_idx, param_idx)) = self.dragging_slider.take() {
-                        let storage = Self::storage_index(mat_idx);
-                        self.material_sliders[storage][param_idx].end_drag();
+            InputEvent::PointerReleased { position, button, .. } => {
+                if *button == Some(MouseButton::Left) {
+                    if let Some(slot) = self.dragging_slider.take() {
+                        self.end_slot_drag(slot);
                         return true;
                     }
                     self.camera.on_drag_end();
@@ -1371,11 +1177,8 @@ impl DeclarativeApp for GalleryApp {
     }
 
     fn on_pointer_move(&mut self, x: f32, y: f32) {
-        if let Some((mat_idx, param_idx)) = self.dragging_slider {
-            let (tx, _, tw, _) = self.slider_track_xywh(param_idx);
-            let storage = Self::storage_index(mat_idx);
-            self.material_sliders[storage][param_idx].drag_to(x, tx, tw);
-            self.sync_value_from_slider(mat_idx, param_idx);
+        if let Some(slot) = self.dragging_slider {
+            self.drag_slot_to(slot, x);
             return;
         }
         if self.camera.dragging {
@@ -1441,12 +1244,12 @@ impl SceneApp for GalleryApp {
         renderer.add_mesh("water_surface", &procedural::water_plane(6.0, 0.0, 32), None);
         renderer.add_mesh("torus", &procedural::torus(0.4, 0.15, 32, 16), None);
 
-        // ── Custom PBR Material Pipeline (replaces prepass) ──
-        let pbr_pass = PbrMaterialPass::new(&device, &queue, ctx.surface_format);
+        // ── Material pass (murakumo) ──
+        let mat_pass = MaterialPass::new(&renderer);
 
-        // Write initial lights to our PBR pass
+        // Write initial lights
         let lights = build_light_uniform();
-        queue.write_buffer(&pbr_pass.light_buffer, 0, bytemuck::bytes_of(&lights));
+        mat_pass.update_lights(&queue, &lights);
 
         // Write identity shadow matrix
         let identity: [[f32; 4]; 4] = [
@@ -1456,7 +1259,7 @@ impl SceneApp for GalleryApp {
             [0.0, 0.0, 0.0, 1.0],
         ];
         queue.write_buffer(
-            &pbr_pass.shadow_light_vp_buffer,
+            mat_pass.shadow_light_vp_buffer(),
             0,
             bytemuck::bytes_of(&identity),
         );
@@ -1465,7 +1268,7 @@ impl SceneApp for GalleryApp {
         let bg_pass = BackgroundPass::new(&device, ctx.surface_format);
 
         self.renderer = Some(renderer);
-        self.pbr_pass = Some(pbr_pass);
+        self.mat_pass = Some(mat_pass);
         self.bg_pass = Some(bg_pass);
     }
 
@@ -1481,7 +1284,7 @@ impl SceneApp for GalleryApp {
 
     fn render_scene(&mut self, ctx: &mut SceneRenderContext) {
         let Some(ref renderer) = self.renderer else { return };
-        let Some(ref pbr_pass) = self.pbr_pass else { return };
+        let Some(ref mut mat_pass) = self.mat_pass else { return };
         let Some(ref bg_pass) = self.bg_pass else { return };
 
         let cam_pos = self.camera.position();
@@ -1543,31 +1346,22 @@ impl SceneApp for GalleryApp {
         // Update camera uniform (with time in position.w)
         let vp = self.camera.view_proj();
         let view = self.camera.view_matrix();
-        let pbr_cam = PbrCameraUniform {
+        let cam_uniform = CameraUniform {
             view_proj: vp.to_cols_array_2d(),
             view: view.to_cols_array_2d(),
-            position: [eye_pos[0], eye_pos[1], eye_pos[2], self.time],
+            position: [eye_pos[0], eye_pos[1], eye_pos[2], 1.0],
             clip_min: [0.0; 4],
             clip_max: [0.0; 4],
         };
-        ctx.queue.write_buffer(
-            &pbr_pass.camera_buffer,
-            0,
-            bytemuck::bytes_of(&pbr_cam),
-        );
+        mat_pass.update_camera(&ctx.queue, &cam_uniform, self.time);
 
-        // Update material params uniform (all 23 materials, current values)
-        let mut params_arr: [[f32; PARAMS_PER_MATERIAL]; MATERIAL_COUNT] =
-            [[0.0; PARAMS_PER_MATERIAL]; MATERIAL_COUNT];
+        // Sync material params from slider values
         for k in 0..MATERIAL_COUNT {
-            params_arr[k] = self.material_param_values[k];
+            for p in 0..PARAMS_PER_MATERIAL {
+                mat_pass.set_param(k, p, self.material_param_values[k][p]);
+            }
         }
-        let mat_params = MatParamsUniform::from_values(&params_arr);
-        ctx.queue.write_buffer(
-            &pbr_pass.mat_params_buffer,
-            0,
-            bytemuck::bytes_of(&mat_params),
-        );
+        mat_pass.upload_params(&ctx.queue);
 
         // Determine which materials to draw and how
         let detail_index = match &self.state {
@@ -1577,70 +1371,90 @@ impl SceneApp for GalleryApp {
             _ => None,
         };
 
-        let instance_size = std::mem::size_of::<InstanceData>();
-        let mut instance_data = Vec::with_capacity(MATERIAL_COUNT * instance_size);
-
-        // For Field scene: we need an extra instance for water
-        let is_field = detail_index == Some(FIELD_INDEX);
+        // Build draw list using MaterialDraw API
+        let mut draws: Vec<MaterialDraw> = Vec::new();
 
         if let Some(idx) = detail_index {
-            // Detail mode
-            for i in 0..MATERIAL_COUNT {
-                if i == idx {
-                    let scale = detail_scale(idx);
-                    let y_off = detail_y_offset(idx);
-                    let is_static = is_landscape_material(idx) || idx == FIELD_INDEX;
-                    let yaw = if is_static { 0.0 } else { self.time * 0.1 };
-                    let model = Mat4::from_translation(Vec3::new(0.0, y_off, 0.0))
-                        * Mat4::from_rotation_y(yaw)
-                        * Mat4::from_scale(scale);
-                    let cols = model.to_cols_array_2d();
+            // Detail mode: single material (+ optional water for field)
+            let mesh_id = detail_mesh_id(idx);
+            if let Some(mesh) = renderer.get_mesh(mesh_id) {
+                let scale = detail_scale(idx);
+                let y_off = detail_y_offset(idx);
+                let is_static = is_landscape_material(idx) || idx == FIELD_INDEX;
+                let yaw = if is_static { 0.0 } else { self.time * 0.1 };
+                let model = Mat4::from_translation(Vec3::new(0.0, y_off, 0.0))
+                    * Mat4::from_rotation_y(yaw)
+                    * Mat4::from_scale(scale);
 
-                    // Field uses Rock material (kind=21) for terrain
-                    let mat_kind = if idx == FIELD_INDEX { 21.0 } else { idx as f32 };
-                    let (metallic, roughness) = if idx == FIELD_INDEX {
-                        (0.0, 0.9)
-                    } else {
-                        match idx {
-                            0 => (0.0, 0.1), 1 => (0.1, 0.05), 2 => (0.0, 0.3),
-                            3 => (0.3, 0.5), 4 => (0.0, 0.15), 5 => (0.0, 0.8),
-                            6 => (0.0, 0.9), 7 => (0.0, 0.4), 8 => (0.5, 0.2),
-                            9 => (0.2, 0.1), 10 => (1.0, 0.3), 11 => (0.0, 0.1),
-                            12 => (0.3, 0.2), 13 => (0.0, 0.4), 14 => (0.0, 0.5),
-                            15 => (0.0, 0.8), 16 => (0.1, 0.15), 17 => (0.0, 0.9),
-                            18 => (0.0, 0.8), 19 => (0.0, 0.7), 20 => (0.0, 0.4),
-                            21 => (0.0, 0.9),
-                            _ => (0.0, 0.5),
-                        }
-                    };
-                    let flat_flag = if is_landscape_material(idx) || idx == FIELD_INDEX { 1.0 } else { 0.0 };
-                    let inst = InstanceData {
-                        model: cols,
+                let mat_kind = if idx == FIELD_INDEX { 21.0 } else { idx as f32 };
+                let (metallic, roughness) = if idx == FIELD_INDEX {
+                    (0.0, 0.9)
+                } else {
+                    match idx {
+                        0 => (0.0, 0.1), 1 => (0.1, 0.05), 2 => (0.0, 0.3),
+                        3 => (0.3, 0.5), 4 => (0.0, 0.15), 5 => (0.0, 0.8),
+                        6 => (0.0, 0.9), 7 => (0.0, 0.4), 8 => (0.5, 0.2),
+                        9 => (0.2, 0.1), 10 => (1.0, 0.3), 11 => (0.0, 0.1),
+                        12 => (0.3, 0.2), 13 => (0.0, 0.4), 14 => (0.0, 0.5),
+                        15 => (0.0, 0.8), 16 => (0.1, 0.15), 17 => (0.0, 0.9),
+                        18 => (0.0, 0.8), 19 => (0.0, 0.7), 20 => (0.0, 0.4),
+                        21 => (0.0, 0.9),
+                        _ => (0.0, 0.5),
+                    }
+                };
+                let flat_flag = if is_landscape_material(idx) || idx == FIELD_INDEX { 1.0 } else { 0.0 };
+
+                let layer = if let Some(k2) = self.material_layer2[idx] {
+                    LayerInstance::with_layer(k2, self.material_layer2_alpha[idx])
+                } else {
+                    LayerInstance::none()
+                };
+
+                draws.push(MaterialDraw {
+                    material_index: idx,
+                    mesh,
+                    instance: InstanceData {
+                        model: model.to_cols_array_2d(),
                         color: [1.0, 1.0, 1.0, 1.0],
                         material: [metallic, roughness, mat_kind, flat_flag],
-                    };
-                    instance_data.extend_from_slice(bytemuck::bytes_of(&inst));
-                } else {
-                    let inst = InstanceData {
-                        model: [[0.0; 4]; 4],
-                        color: [0.0; 4],
-                        material: [0.0, 0.5, i as f32, 0.0],
-                    };
-                    instance_data.extend_from_slice(bytemuck::bytes_of(&inst));
+                    },
+                    layer,
+                });
+            }
+
+            // Field scene: add water surface
+            if idx == FIELD_INDEX {
+                if let Some(water_mesh) = renderer.get_mesh("water_surface") {
+                    draws.push(MaterialDraw {
+                        material_index: 4, // Water
+                        mesh: water_mesh,
+                        instance: InstanceData {
+                            model: Mat4::from_translation(Vec3::new(0.4, -0.02, 0.2)).to_cols_array_2d(),
+                            color: [1.0, 1.0, 1.0, 1.0],
+                            material: [0.0, 0.15, 4.0, 0.0],
+                        },
+                        layer: LayerInstance::none(),
+                    });
                 }
             }
         } else {
-            // Grid mode: all materials in grid
+            // Grid mode: all materials
             for i in 0..MATERIAL_COUNT {
-                let inst = build_instance(i, self.time);
-                instance_data.extend_from_slice(bytemuck::bytes_of(&inst));
+                let mesh_id = mesh_id_for_material(i);
+                if let Some(mesh) = renderer.get_mesh(mesh_id) {
+                    draws.push(MaterialDraw {
+                        material_index: i,
+                        mesh,
+                        instance: build_instance(i, self.time),
+                        layer: LayerInstance::none(),
+                    });
+                }
             }
         }
 
-        ctx.queue.write_buffer(&pbr_pass.instance_buffer, 0, &instance_data);
-
-        // Draw materials
+        // Draw materials using MaterialPass
         {
+            let device = renderer.device();
             let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pbr_material_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1663,114 +1477,21 @@ impl SceneApp for GalleryApp {
                 occlusion_query_set: None,
             });
 
-            let draw_range: Vec<usize> = if let Some(idx) = detail_index {
-                vec![idx]
-            } else {
-                (0..MATERIAL_COUNT).collect()
-            };
-
-            // Resolve mesh ID: detail mode may use different mesh
-            let get_mesh_id = |i: usize| -> &str {
-                if detail_index == Some(i) {
-                    detail_mesh_id(i)
-                } else {
-                    mesh_id_for_material(i)
-                }
-            };
-
-            // Pass 1: Opaque materials
-            pass.set_pipeline(&pbr_pass.pipeline);
-            pass.set_bind_group(0, &pbr_pass.camera_bind_group, &[]);
-            pass.set_bind_group(1, &pbr_pass.light_bind_group, &[]);
-            pass.set_bind_group(2, &pbr_pass.texture_bind_group, &[]);
-            pass.set_bind_group(3, &pbr_pass.shadow_bind_group, &[]);
-
-            for &i in &draw_range {
-                if is_transparent_material(i) { continue; }
-                let mesh_id = get_mesh_id(i);
-                if let Some(mesh) = renderer.get_mesh(mesh_id) {
-                    let offset = (i * instance_size) as u64;
-                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    pass.set_vertex_buffer(1, pbr_pass.instance_buffer.slice(offset..));
-                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                }
-            }
-
-            // Pass 2: Transparent materials
-            pass.set_pipeline(&pbr_pass.transparent_pipeline);
-
-            for &i in &draw_range {
-                if !is_transparent_material(i) { continue; }
-                let mesh_id = get_mesh_id(i);
-                if let Some(mesh) = renderer.get_mesh(mesh_id) {
-                    let offset = (i * instance_size) as u64;
-                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    pass.set_vertex_buffer(1, pbr_pass.instance_buffer.slice(offset..));
-                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                }
-            }
-
-            // Field scene: draw water surface on top (transparent, uses Water material kind=4)
-            if is_field {
-                if let Some(water_mesh) = renderer.get_mesh("water_surface") {
-                    // Position water at pond center, just below terrain rim
-                    let water_model = Mat4::from_translation(Vec3::new(0.4, -0.02, 0.2));
-                    let water_inst = InstanceData {
-                        model: water_model.to_cols_array_2d(),
-                        color: [1.0, 1.0, 1.0, 1.0],
-                        material: [0.0, 0.15, 4.0, 0.0], // kind=4 (Water), flat=0 (real normal is fine)
-                    };
-                    // Write water instance to slot 0 (unused in field mode)
-                    ctx.queue.write_buffer(
-                        &pbr_pass.instance_buffer,
-                        0,
-                        bytemuck::bytes_of(&water_inst),
-                    );
-                    pass.set_vertex_buffer(0, water_mesh.vertex_buffer.slice(..));
-                    pass.set_vertex_buffer(1, pbr_pass.instance_buffer.slice(..));
-                    pass.set_index_buffer(water_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..water_mesh.index_count, 0, 0..1);
-                }
-            }
+            mat_pass.render(device, &ctx.queue, &mut pass, &draws);
         }
     }
 }
 
-/// Build the light uniform data for our PBR pass
-fn build_light_uniform() -> LightUniformData {
-    let mut data = LightUniformData {
-        ambient_and_count: [0.08, 0.08, 0.12, 3.0], // 3 lights
-        lights: [GpuLightData {
-            direction_or_position_and_type: [0.0; 4],
-            color_and_intensity: [0.0; 4],
-            extra: [0.0; 4],
-        }; 8],
-    };
-
-    // Key light (directional, type=0)
-    data.lights[0] = GpuLightData {
-        direction_or_position_and_type: [0.5, 0.8, 0.6, 0.0],
-        color_and_intensity: [1.0, 0.95, 0.88, 1.2],
-        extra: [0.0; 4],
-    };
-
-    // Fill light
-    data.lights[1] = GpuLightData {
-        direction_or_position_and_type: [-0.7, 0.3, 0.4, 0.0],
-        color_and_intensity: [0.6, 0.7, 1.0, 0.5],
-        extra: [0.0; 4],
-    };
-
-    // Rim light
-    data.lights[2] = GpuLightData {
-        direction_or_position_and_type: [0.0, 0.3, -0.9, 0.0],
-        color_and_intensity: [0.8, 0.85, 1.0, 0.4],
-        extra: [0.0; 4],
-    };
-
-    data
+/// Build the light uniform data using Seimei's LightUniform
+fn build_light_uniform() -> LightUniform {
+    LightUniform::from_lights(
+        [0.08, 0.08, 0.12],
+        &[
+            Light::directional([0.5, 0.8, 0.6], [1.0, 0.95, 0.88], 1.2),
+            Light::directional([-0.7, 0.3, 0.4], [0.6, 0.7, 1.0], 0.5),
+            Light::directional([0.0, 0.3, -0.9], [0.8, 0.85, 1.0], 0.4),
+        ],
+    )
 }
 
 fn main() {
