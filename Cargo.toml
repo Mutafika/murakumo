@@ -4,3 +4,12 @@ members = [
     "crates/murakumo",
     "crates/murakumo-gallery",
 ]
+# murakumo-gallery は sabitori 等への path 依存を持つデモ用バイナリ。
+# 通常ビルドからは除外し、本人開発時のみ -p murakumo-gallery で明示ビルドする。
+default-members = ["crates/murakumo"]
+
+# --- Local development override ---
+# 手元の seimei を編集しながら開発する場合は以下のコメントを外す。
+# ../seimei に seimei リポジトリが clone されている前提。
+# [patch."https://github.com/Mutafika/seimei"]
+# seimei = { path = "../seimei" }

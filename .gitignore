@@ -1,1 +1,12 @@
 /target
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+
+# Claude Code
+.claude/scheduled_tasks.lock

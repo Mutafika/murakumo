@@ -10,7 +10,7 @@ sabitori = { path = "../../../sabitori/crates/sabitori" }
 sabitori-style = { path = "../../../sabitori/crates/sabitori-style" }
 sabitori-widgets = { path = "../../../sabitori/crates/sabitori-widgets" }
 sabitori-input = { path = "../../../sabitori/crates/sabitori-input" }
-seimei = { path = "../../../seimei", default-features = false }
+seimei = { git = "https://github.com/Mutafika/seimei", default-features = false }
 wgpu = { version = "24", features = ["webgl"] }
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }

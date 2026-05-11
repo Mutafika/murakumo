@@ -6,7 +6,7 @@ description = "Seimei上のマテリアル/エフェクト集 — 叢雲"
 license = "MIT"
 
 [dependencies]
-seimei = { path = "../../../seimei", default-features = false }
+seimei = { git = "https://github.com/Mutafika/seimei", default-features = false }
 wgpu = "24"
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
