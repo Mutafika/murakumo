@@ -9,7 +9,7 @@
 ## Crates
 
 - `murakumo` — マテリアル / エフェクト本体（publish 対象）
-- `murakumo-gallery` — デモ・展示用バイナリ（publish 対象外、ローカル開発専用）
+- `murakumo-gallery` — デモ・展示用バイナリ（publish 対象外）
 
 ## Usage
 
@@ -29,24 +29,24 @@ murakumo = { git = "https://github.com/Mutafika/murakumo", rev = "<commit-hash>"
 
 ## Local Development
 
-`murakumo-gallery` は手元での開発・確認用バイナリで、隣接ディレクトリの
-`seimei` / `sabitori` リポジトリに path 依存しています。`default-members`
-で通常ビルドから除外しているので、外部利用者は意識する必要はありません。
+`murakumo-gallery` は seimei / sabitori にも依存しているデモ用バイナリで、
+ビルドが重いため `default-members` で通常ビルドからは除外しています。
+
+gallery をビルドする場合は明示的に指定:
+
+```sh
+cargo build -p murakumo-gallery
+```
+
+seimei / sabitori を手元で編集しながら Murakumo を開発する場合は、
+ルート `Cargo.toml` の `[patch]` セクションのコメントを外してください。
+`../seimei`, `../sabitori` にそれぞれリポジトリが clone されている前提です。
 
 ```
 myapp/
 ├── seimei/      # https://github.com/Mutafika/seimei
 ├── sabitori/    # https://github.com/Mutafika/sabitori
 └── murakumo/
-```
-
-seimei を手元で編集しながら Murakumo を開発する場合は、ルート `Cargo.toml`
-の `[patch]` セクションのコメントを外してください。
-
-gallery をビルドする場合は明示的に指定:
-
-```
-cargo build -p murakumo-gallery
 ```
 
 ## License

@@ -6,11 +6,11 @@ publish = false
 
 [dependencies]
 murakumo = { path = "../murakumo" }
-sabitori = { path = "../../../sabitori/crates/sabitori" }
-sabitori-style = { path = "../../../sabitori/crates/sabitori-style" }
-sabitori-widgets = { path = "../../../sabitori/crates/sabitori-widgets" }
-sabitori-input = { path = "../../../sabitori/crates/sabitori-input" }
-seimei = { git = "https://github.com/Mutafika/seimei", default-features = false }
+sabitori = { git = "https://github.com/Mutafika/sabitori", version = "0.1" }
+sabitori-style = { git = "https://github.com/Mutafika/sabitori", version = "0.1" }
+sabitori-widgets = { git = "https://github.com/Mutafika/sabitori", version = "0.1" }
+sabitori-input = { git = "https://github.com/Mutafika/sabitori", version = "0.1" }
+seimei = { git = "https://github.com/Mutafika/seimei", version = "0.1", default-features = false }
 wgpu = { version = "24", features = ["webgl"] }
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
