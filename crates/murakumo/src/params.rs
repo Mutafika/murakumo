@@ -223,6 +223,54 @@ const FIELD: &[ParamSpec] = &[
     ps("Detail",     0.5, 2.5, 1.0),
 ];
 
+// ── 23: Slash — sword swing trail ──
+const SLASH: &[ParamSpec] = &[
+    ps("Hue",        0.0, 1.0, 0.5),
+    ps("Mode",       0.0, 2.0, 1.0),    // 0=Flash, 1=Hybrid, 2=Sweep
+    ps("Thickness",  0.003, 0.15, 0.025),
+    ps("Curve",     -1.0, 1.0, 0.7),
+    ps("Speed",      0.0, 8.0, 2.0),
+    ps("Length",     0.15, 1.5, 0.7),
+    ps("Angle",      0.0, 1.0, 0.0),
+    ps("Combo",      1.0, 6.0, 1.0),
+];
+
+// ── 24: Blood — spraying / spurting droplets (volumetric) ──
+const BLOOD: &[ParamSpec] = &[
+    ps("Hue",        0.9, 1.1, 0.99),   // 0.99 ≈ deep red, lower=pink, higher=purple
+    ps("Density",    0.0, 3.0, 1.0),    // jet/particle density multiplier
+    ps("Speed",      0.1, 3.0, 1.0),    // particle initial velocity
+    ps("Spread",     0.1, 1.0, 0.6),    // cone half-angle (0.1=narrow column, 1.0=full sphere)
+    ps("Gravity",    0.0, 4.0, 1.5),    // how hard particles fall
+    ps("Drop Size",  0.02, 0.2, 0.06),
+    ps("Trail",      0.0, 1.0, 0.4),    // streak length per particle
+    ps("Brightness", 0.0, 3.0, 1.0),
+];
+
+// ── 25: Summon — magic circle ──
+const SUMMON: &[ParamSpec] = &[
+    ps("Hue",        0.0, 1.0, 0.7),
+    ps("Rings",      1.0, 6.0, 3.0),
+    ps("Rotation",  -3.0, 3.0, 1.0),
+    ps("Runes",      4.0, 24.0, 12.0),
+    ps("Pulse",      0.0, 4.0, 1.0),
+    ps("Brightness", 0.0, 4.0, 1.5),
+    ps("Beam",       0.0, 2.0, 0.6),
+    ps("Glow",       0.0, 2.0, 1.0),
+];
+
+// ── 26: Aura — radiant surrounding energy ──
+const AURA: &[ParamSpec] = &[
+    ps("Hue",        0.0, 1.0, 0.083),
+    ps("Intensity",  0.0, 3.0, 1.0),
+    ps("Speed",      0.0, 5.0, 1.5),
+    ps("Radius",     0.5, 1.5, 1.0),
+    ps("Density",    0.0, 3.0, 1.0),
+    ps("Pulse",      0.0, 5.0, 1.0),
+    ps("Wave",       0.0, 4.0, 1.5),
+    ps("Brightness", 0.0, 4.0, 1.5),
+];
+
 pub fn material_params(material_index: usize) -> &'static [ParamSpec] {
     match material_index {
         0  => BUBBLE,
@@ -248,6 +296,10 @@ pub fn material_params(material_index: usize) -> &'static [ParamSpec] {
         20 => SKIN,
         21 => ROCK,
         22 => FIELD,
+        23 => SLASH,
+        24 => BLOOD,
+        25 => SUMMON,
+        26 => AURA,
         _ => NONE,
     }
 }

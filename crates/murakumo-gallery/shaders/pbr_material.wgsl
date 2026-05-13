@@ -39,7 +39,7 @@ var<uniform> light_data: LightUniform;
 // Per-material tunable params (shares group 1 with lights to fit
 // inside the default `max_bind_groups: 4` limit).
 struct MatParamsUniform {
-    values: array<vec4<f32>, 46>,
+    values: array<vec4<f32>, 54>,
 };
 
 @group(1) @binding(1)
@@ -161,6 +161,11 @@ struct InstanceInput {
     @location(6) model_matrix_3: vec4<f32>,
     @location(7) color: vec4<f32>,
     @location(8) material: vec4<f32>,  // [metallic, roughness, kind, emissive]
+    // Secondary layer (gallery-only feature, fed via a second instance buffer):
+    //   layer2.x = kind of secondary material (-1 = no layer)
+    //   layer2.y = alpha mix (0..1)
+    //   layer2.z, .w reserved
+    @location(11) layer2: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -171,6 +176,7 @@ struct VertexOutput {
     @location(3) color: vec4<f32>,
     @location(4) material: vec4<f32>,
     @location(5) object_center: vec3<f32>,
+    @location(6) layer2: vec4<f32>,
 };
 
 // ════════════════════════════════════════════════════
@@ -201,6 +207,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.uv = vertex.uv;
     out.color = instance.color * vertex.vertex_color;
     out.material = instance.material;
+    out.layer2 = instance.layer2;
     // Extract object center from model matrix (translation column)
     out.object_center = vec3<f32>(
         model_matrix[3].x,
@@ -2133,9 +2140,385 @@ fn mat_skin(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResul
     return r;
 }
 
+// ── 23: Slash — sword swing trail (UV plane, vertical billboard) ──
+//
+// Visual: a curved arc that pulses on/off with a bright "head" sweeping
+// across each cycle, leaving a fading trail behind.
+
+fn mat_slash(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, uv: vec2<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let p_hue        = clamp(mp(23u, 0u), 0.0, 1.0);
+    let p_brightness = max(mp(23u, 1u), 0.0);
+    let p_thickness  = max(mp(23u, 2u), 0.002);
+    let p_curve      = clamp(mp(23u, 3u), -1.0, 1.0);
+    let p_speed      = max(mp(23u, 4u), 0.0);
+    let p_length     = clamp(mp(23u, 5u), 0.05, 2.0);
+    let p_sharp      = max(mp(23u, 6u), 0.1);
+    let p_trail      = clamp(mp(23u, 7u), 0.0, 1.0);
+
+    // Center-origin coordinates: x ∈ [-0.5, 0.5], y ∈ [-0.5, 0.5]
+    let x = uv.x - 0.5;
+    let y = uv.y - 0.5;
+
+    // Arc curve through the plane: y as a function of x (parabola).
+    // p_curve in [-1, 1] controls bow: positive bows up, negative bows down.
+    // arc_y = -p_curve * (1 - 4 x²) * 0.3 means at x=0 the arc is at y = -p_curve*0.3.
+    let arc_y = -p_curve * (1.0 - 4.0 * x * x) * 0.3;
+    let dy = y - arc_y;
+
+    // Always-on static arc width (Gaussian)
+    let core = exp(-(dy * dy) / (p_thickness * p_thickness * 0.5));
+    let glow = exp(-(dy * dy) / (p_thickness * p_thickness * 4.0)) * 0.35;
+    let arc_intensity = core + glow;  // peaks at 1.35 on the curve, decays fast
+
+    // Head sweep along the arc (x): −0.6 → +0.6 over the swing, then a rest period.
+    let cycle = max(1.4 / max(p_speed, 0.05), 0.001);
+    let phase = fract(t / cycle);
+    let swing = clamp(phase / 0.55, 0.0, 1.0);
+    let head_x = mix(-0.7, 0.7, swing);
+    let dx = head_x - x;  // positive: this point is BEHIND the head (already swept)
+
+    // Trail mask: only behind head, fading over p_length, sharpened by p_sharp.
+    // Extra `swing_alive` makes the slash disappear during the rest portion.
+    let in_trail = step(0.0, dx);
+    let trail_lin = clamp(1.0 - dx / max(p_length, 0.001), 0.0, 1.0) * in_trail;
+    let trail = pow(trail_lin, mix(3.0, 0.8, p_trail));
+    let swing_alive = step(phase, 0.6);
+
+    // Sharp leading head spike
+    let head_glow = exp(-dx * dx * (180.0 + p_sharp * 60.0)) * step(-0.05, dx);
+
+    let line_intensity = arc_intensity * trail * swing_alive;
+    let head_intensity = arc_intensity * head_glow * 1.5 * swing_alive;
+    let total = line_intensity + head_intensity;
+
+    let body_col = hue_color(p_hue);
+    let white_mix = smoothstep(0.6, 2.0, total);
+    let col = mix(body_col, vec3<f32>(1.0), white_mix);
+
+    let emission = col * total * (2.0 + p_brightness);
+    let alpha = clamp(total * 1.4, 0.0, 1.0);
+
+    r.albedo = vec3<f32>(0.0);
+    r.emission = emission;
+    r.metallic = 0.0;
+    r.roughness = 0.3;
+    r.alpha = alpha;
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
+// ── 24: Blood — dripping wet surface ──
+
+fn mat_blood(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResult {
+    var r: MaterialResult;
+    let p_hue        = clamp(mp(24u, 0u), 0.85, 1.15);
+    let p_density    = max(mp(24u, 1u), 0.0);
+    let p_drip_speed = max(mp(24u, 2u), 0.0);
+    let p_splatter   = max(mp(24u, 3u), 0.0);
+    let p_wetness    = clamp(mp(24u, 4u), 0.0, 1.0);
+    let p_brightness = max(mp(24u, 5u), 0.0);
+    let p_drip_len   = max(mp(24u, 6u), 0.05);
+    let p_coverage   = clamp(mp(24u, 7u), 0.0, 1.0);
+
+    let view_dir = normalize(ep - wp);
+    let n_dot_v = max(dot(n, view_dir), 0.0);
+
+    // Spherical coords for stable surface flow
+    let theta = atan2(n.z, n.x);  // 0..2π
+    let height = n.y;             // -1..1
+
+    // Drip streaks: vertical channels seeded along theta with random offsets.
+    // Each streak has a head that travels downward over time.
+    let streak_n = 24.0;
+    let cell_x = theta * (streak_n / TAU);
+    let cell_id = floor(cell_x);
+    let cell_f = fract(cell_x);
+    let streak_seed = hash11(cell_id * 13.7);
+    // Streak alive only if seed below density threshold
+    let streak_alive = step(1.0 - clamp(p_density * 0.55, 0.0, 0.95), streak_seed);
+
+    // Drip head Y position: starts at +1, falls to -1 over time
+    let drip_phase = fract(t * 0.25 * p_drip_speed + streak_seed);
+    let drip_head_y = 1.0 - drip_phase * 2.2;
+    // Vertical mask: lit only between head and the seed start
+    let trail_above = smoothstep(drip_head_y - p_drip_len, drip_head_y, height);
+    let head_glow = exp(-pow((height - drip_head_y) * 4.0, 2.0)) * 0.6;
+    // Horizontal streak shape (Gaussian within cell)
+    let h_shape = exp(-pow((cell_f - 0.5) * 6.0, 2.0));
+
+    let streak_val = streak_alive * h_shape * (trail_above + head_glow);
+
+    // Splatter: scattered patches via hash22
+    let splat_p = vec2<f32>(theta * 4.0, height * 6.0);
+    let splat_id = floor(splat_p);
+    let splat_f = fract(splat_p);
+    let splat_seed = hash21(splat_id);
+    let splat_alive = step(1.0 - clamp(p_splatter * 0.4, 0.0, 0.95), splat_seed);
+    let splat_dist = length(splat_f - 0.5);
+    let splat_val = splat_alive * smoothstep(0.35, 0.05, splat_dist);
+
+    // Base coverage at top (running blood)
+    let coverage_mask = smoothstep(-0.2, 0.6, height) * p_coverage;
+
+    let blood_amount = clamp(streak_val + splat_val * 0.6 + coverage_mask * 0.3, 0.0, 1.0);
+
+    // Color: dark crimson → bright red → near pink at very wet spots
+    let base = hue_sat(p_hue) * vec3<f32>(0.6, 0.05, 0.05);  // deep red
+    let bright = hue_sat(p_hue);
+    let blood_col = mix(base, bright, smoothstep(0.3, 1.0, blood_amount)) * p_brightness;
+
+    // Wet specular boost (low roughness on blood patches)
+    let wet_rough = mix(0.4, 0.05, p_wetness * smoothstep(0.05, 0.5, blood_amount));
+
+    // Emission: tiny self-glow on the freshest drips (head_glow)
+    let emit = bright * head_glow * 0.3 * streak_alive * h_shape;
+
+    r.albedo = blood_col;
+    r.emission = emit;
+    r.metallic = 0.0;
+    r.roughness = wet_rough;
+    // Alpha lets the bare sphere show through where there's no blood
+    r.alpha = clamp(blood_amount * 1.4, 0.0, 1.0);
+    r.normal = n;
+    r.is_emissive_only = false;
+    return r;
+}
+
+// ── 25: Summon — magic circle (UV plane) ──
+
+fn mat_summon(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, uv: vec2<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let p_hue        = clamp(mp(25u, 0u), 0.0, 1.0);
+    let p_rings_f    = clamp(mp(25u, 1u), 1.0, 6.0);
+    let p_rotation   = mp(25u, 2u);
+    let p_runes_f    = clamp(mp(25u, 3u), 1.0, 32.0);
+    let p_pulse      = max(mp(25u, 4u), 0.0);
+    let p_brightness = max(mp(25u, 5u), 0.0);
+    let p_beam       = max(mp(25u, 6u), 0.0);
+    let p_glow       = max(mp(25u, 7u), 0.0);
+
+    let pc = uv - 0.5;
+    let dist = length(pc) * 2.0;        // 0 (center) → 1 (edge of unit square)
+    let angle = atan2(pc.y, pc.x);
+
+    // Outer disk mask: drawn within unit circle
+    let disk = smoothstep(1.0, 0.95, dist);
+
+    // Concentric rings — sharp circles at evenly spaced radii
+    let rings_n = floor(p_rings_f + 0.5);
+    let ring_phase = dist * rings_n;
+    let ring_d = abs(fract(ring_phase) - 0.5);
+    let ring_line = smoothstep(0.05, 0.0, ring_d) * smoothstep(1.0, 0.95, dist);
+
+    // Runes: small triangular ticks rotating around a band
+    let rotated_angle = angle + t * p_rotation;
+    let rune_phase = (rotated_angle / TAU + 0.5) * p_runes_f;
+    let rune_id = floor(rune_phase);
+    let rune_f = fract(rune_phase);
+    let rune_band = smoothstep(0.7, 0.62, dist) * smoothstep(0.55, 0.62, dist);
+    let rune_seed = hash11(rune_id);
+    let rune_active = step(0.4, rune_seed);
+    let rune_shape = smoothstep(0.5, 0.2, abs(rune_f - 0.5));
+    let rune_pulse = 0.7 + 0.3 * sin(t * 4.0 * p_pulse + rune_id * 1.7);
+    let runes = rune_band * rune_active * rune_shape * rune_pulse;
+
+    // Inner star/flower: petals via cos
+    let petal = abs(cos(rotated_angle * 6.0));
+    let petal_band = smoothstep(0.45, 0.35, dist) * smoothstep(0.15, 0.25, dist);
+    let petal_v = pow(petal, 4.0) * petal_band;
+
+    // Central beam (vertical-ish glow at the center)
+    let center_glow = exp(-dist * dist * 30.0) * p_beam;
+    let mid_pulse = 0.7 + 0.3 * sin(t * 3.0 * p_pulse);
+
+    let base_col = hue_color(p_hue);
+    let bright_col = mix(base_col, vec3<f32>(1.0), 0.4);
+
+    var color = vec3<f32>(0.0);
+    color += base_col * ring_line * 1.4;
+    color += bright_col * runes * 1.6;
+    color += base_col * petal_v * 1.0;
+    color += bright_col * center_glow * 1.5 * mid_pulse;
+
+    // Outer glow halo
+    let halo = exp(-pow(dist - 0.95, 2.0) / 0.005) * 0.7 * p_glow;
+    color += base_col * halo;
+
+    color *= p_brightness;
+
+    let lum = max(color.x, max(color.y, color.z));
+    let alpha = clamp(lum * 1.4 + ring_line * 0.6 + runes * 0.6 + center_glow * 0.6, 0.0, 1.0) * disk;
+
+    r.albedo = vec3<f32>(0.0);
+    r.emission = color * disk;
+    r.metallic = 0.0;
+    r.roughness = 0.4;
+    r.alpha = alpha;
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
+// ── 26: Aura — radiant surrounding energy (volumetric) ──
+
+fn aura_density(p: vec3<f32>, t: f32, p_density: f32, p_wave: f32) -> f32 {
+    let r2 = dot(p, p);
+    let r = sqrt(r2);
+    // Shell density peaks just past r = 0.85 and falls off outward
+    let shell = smoothstep(1.4, 0.85, r) * smoothstep(0.5, 0.85, r);
+
+    // Upward streaks (waves)
+    let phi = atan2(p.x, p.z);
+    let height = p.y;
+    let streak = sin(phi * 6.0 + t * 3.0 + height * 8.0) * 0.5 + 0.5;
+    let stream_mask = mix(1.0, streak, clamp(p_wave * 0.3, 0.0, 1.0));
+
+    // Turbulence
+    let warp = vec3<f32>(
+        simplex3d(p * 1.5 + vec3<f32>(t * 0.3, 0.0, 1.7)),
+        simplex3d(p * 1.5 + vec3<f32>(0.0, t * 0.4, 4.7)),
+        simplex3d(p * 1.5 + vec3<f32>(3.1, t * 0.2, 0.0)),
+    );
+    let nn = simplex3d(p * 3.0 + warp * 0.5 + vec3<f32>(0.0, -t * 1.2, 0.0)) * 0.5 + 0.5;
+
+    return max(nn * shell * stream_mask * p_density - 0.05, 0.0) * 2.0;
+}
+
+fn mat_aura(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let p_hue        = clamp(mp(26u, 0u), 0.0, 1.0);
+    let p_intensity  = max(mp(26u, 1u), 0.0);
+    let p_speed      = max(mp(26u, 2u), 0.0);
+    let p_radius     = clamp(mp(26u, 3u), 0.5, 1.5);
+    let p_density    = max(mp(26u, 4u), 0.0);
+    let p_pulse      = max(mp(26u, 5u), 0.0);
+    let p_wave       = max(mp(26u, 6u), 0.0);
+    let p_brightness = max(mp(26u, 7u), 0.0);
+    let ts = t * p_speed;
+
+    let view_dir = normalize(wp - ep);
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - p_radius * p_radius;
+    let disc = b * b - c_val;
+    if disc < 0.0 {
+        r.albedo = vec3<f32>(0.0); r.emission = vec3<f32>(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.5; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far  = -b + sqrt_disc;
+    let march_dist = t_far - t_near;
+
+    let steps = 28;
+    let step_size = march_dist / f32(steps);
+    var transmittance = 1.0;
+    var accum = vec3<f32>(0.0);
+
+    let main_col = hue_sat(p_hue);
+    let bright_col = mix(main_col, vec3<f32>(1.0), 0.5);
+
+    let pulse = 0.85 + 0.15 * sin(ts * 4.0 * p_pulse) * sin(ts * 2.7 * p_pulse + 1.3);
+
+    for (var i = 0; i < 28; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let p = ep + view_dir * ray_t - obj_center;
+        let d = aura_density(p, ts, p_density, p_wave);
+        if d > 0.001 {
+            // Color: warmer/brighter near interior, mid-shell is pure hue
+            let r_local = length(p);
+            let inner = smoothstep(1.0, 0.7, r_local);
+            let col = mix(main_col, bright_col, inner);
+
+            accum += col * d * step_size * transmittance * 4.5 * p_intensity * pulse;
+            transmittance *= exp(-d * 4.0 * step_size);
+        }
+        if transmittance < 0.02 { break; }
+    }
+
+    accum *= p_brightness;
+
+    r.albedo = vec3<f32>(0.0);
+    r.emission = accum;
+    r.metallic = 0.0;
+    r.roughness = 0.5;
+    r.alpha = clamp((1.0 - transmittance) * 1.3, 0.0, 1.0);
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
 // ════════════════════════════════════════════════════
 //  Fragment Shader — dispatch by kind, apply PBR
 // ════════════════════════════════════════════════════
+
+/// Dispatch a single material kind. Used both for the primary material and
+/// optional secondary layer.
+fn dispatch_material(
+    k: u32,
+    wp: vec3<f32>,
+    wn: vec3<f32>,
+    ep: vec3<f32>,
+    t: f32,
+    uv: vec2<f32>,
+    obj_center: vec3<f32>,
+) -> MaterialResult {
+    var mat: MaterialResult;
+    switch k {
+        case 0u:  { mat = mat_bubble(wp, wn, ep, t); }
+        case 1u:  { mat = mat_glass(wp, wn, ep, t); }
+        case 2u:  { mat = mat_portal(wp, wn, ep, t, uv); }
+        case 3u:  { mat = mat_grid(wp, wn, ep, t, uv); }
+        case 4u:  { mat = mat_water(wp, wn, ep, t); }
+        case 5u:  { mat = mat_fire(wp, wn, ep, t, obj_center); }
+        case 6u:  { mat = mat_smoke(wp, wn, ep, t, obj_center); }
+        case 7u:  { mat = mat_aurora(wp, wn, ep, t, uv); }
+        case 8u:  { mat = mat_hologram(wp, wn, ep, t, uv); }
+        case 9u:  { mat = mat_crystal(wp, wn, ep, t); }
+        case 10u: { mat = mat_metal(wp, wn, ep, t); }
+        case 11u: { mat = mat_neon(wp, wn, ep, t, uv); }
+        case 12u: { mat = mat_shield(wp, wn, ep, t); }
+        case 13u: { mat = mat_dissolve(wp, wn, ep, t, uv); }
+        case 14u: { mat = mat_lightning(wp, wn, ep, t, obj_center); }
+        case 15u: { mat = mat_lava(wp, wn, ep, t); }
+        case 16u: { mat = mat_ice(wp, wn, ep, t); }
+        case 17u: { mat = mat_cloud(wp, wn, ep, t, obj_center); }
+        case 18u: { mat = mat_explosion(wp, wn, ep, t, obj_center); }
+        case 19u: { mat = mat_tornado(wp, wn, ep, t, obj_center); }
+        case 20u: { mat = mat_skin(wp, wn, ep, t); }
+        case 21u: { mat = mat_rock(wp, wn, ep, t); }
+        case 23u: { mat = mat_slash(wp, wn, ep, t, uv); }
+        case 24u: { mat = mat_blood(wp, wn, ep, t); }
+        case 25u: { mat = mat_summon(wp, wn, ep, t, uv); }
+        case 26u: { mat = mat_aura(wp, wn, ep, t, obj_center); }
+        default:  { mat = mat_metal(wp, wn, ep, t); }
+    }
+    return mat;
+}
+
+/// Composite a secondary layer onto a primary `MaterialResult`.
+/// `b_mix` is the secondary layer's alpha multiplier (0..1).
+/// - emission: additive (b scaled by b_mix)
+/// - albedo:   "OVER" of a by b
+/// - alpha:    1 - (1-a)(1-b·b_mix)
+/// - metallic/roughness: weighted toward primary
+/// - normal: keep primary (lighting stays consistent)
+fn composite_layers(a: MaterialResult, b: MaterialResult, b_mix: f32) -> MaterialResult {
+    let bm = clamp(b_mix, 0.0, 1.0);
+    let bb_a = b.alpha * bm;
+    var r: MaterialResult;
+    r.emission = a.emission + b.emission * bm;
+    r.albedo   = mix(a.albedo, b.albedo, bb_a);
+    r.alpha    = 1.0 - (1.0 - a.alpha) * (1.0 - bb_a);
+    r.metallic = mix(a.metallic, b.metallic, bb_a * 0.5);
+    r.roughness= mix(a.roughness, b.roughness, bb_a * 0.5);
+    r.normal   = a.normal;
+    r.is_emissive_only = a.is_emissive_only && b.is_emissive_only;
+    return r;
+}
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -2145,45 +2528,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let raw_normal = normalize(in.world_normal);
     let uv = in.uv;
 
-    // Landscape mode: material.w > 0.5 means huge sphere (planet surface)
-    // Normal is valid but we need to use world position for texture tiling
     let is_landscape = in.material.w > 0.5;
     var wn: vec3<f32>;
     if is_landscape {
-        // Use world position for pattern generation (tiles across surface)
         wn = normalize(vec3<f32>(wp.x * 0.3, wp.z * 0.3, wp.y * 0.3 + 0.5));
     } else {
         wn = raw_normal;
     }
 
-    // Material kind from instance data
+    // Primary material
     let k = u32(in.material.z + 0.5);
+    var mat = dispatch_material(k, wp, wn, ep, t, uv, in.object_center);
 
-    var mat: MaterialResult;
-    switch k {
-        case 0u:  { mat = mat_bubble(wp, wn, ep, t); }
-        case 1u:  { mat = mat_glass(wp, wn, ep, t); }
-        case 2u:  { mat = mat_portal(wp, wn, ep, t, uv); }
-        case 3u:  { mat = mat_grid(wp, wn, ep, t, uv); }
-        case 4u:  { mat = mat_water(wp, wn, ep, t); }
-        case 5u:  { mat = mat_fire(wp, wn, ep, t, in.object_center); }
-        case 6u:  { mat = mat_smoke(wp, wn, ep, t, in.object_center); }
-        case 7u:  { mat = mat_aurora(wp, wn, ep, t, uv); }
-        case 8u:  { mat = mat_hologram(wp, wn, ep, t, uv); }
-        case 9u:  { mat = mat_crystal(wp, wn, ep, t); }
-        case 10u: { mat = mat_metal(wp, wn, ep, t); }
-        case 11u: { mat = mat_neon(wp, wn, ep, t, uv); }
-        case 12u: { mat = mat_shield(wp, wn, ep, t); }
-        case 13u: { mat = mat_dissolve(wp, wn, ep, t, uv); }
-        case 14u: { mat = mat_lightning(wp, wn, ep, t, in.object_center); }
-        case 15u: { mat = mat_lava(wp, wn, ep, t); }
-        case 16u: { mat = mat_ice(wp, wn, ep, t); }
-        case 17u: { mat = mat_cloud(wp, wn, ep, t, in.object_center); }
-        case 18u: { mat = mat_explosion(wp, wn, ep, t, in.object_center); }
-        case 19u: { mat = mat_tornado(wp, wn, ep, t, in.object_center); }
-        case 20u: { mat = mat_skin(wp, wn, ep, t); }
-        case 21u: { mat = mat_rock(wp, wn, ep, t); }
-        default:  { mat = mat_metal(wp, wn, ep, t); }
+    // Optional secondary layer (layer2.x = kind, -1 = none; layer2.y = alpha mix)
+    let k2 = in.layer2.x;
+    if k2 >= 0.0 {
+        let mat2 = dispatch_material(u32(k2 + 0.5), wp, wn, ep, t, uv, in.object_center);
+        mat = composite_layers(mat, mat2, in.layer2.y);
     }
 
     if mat.alpha < 0.001 {

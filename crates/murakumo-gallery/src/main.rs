@@ -13,8 +13,8 @@ use wgpu::util::DeviceExt;
 
 // ── Constants ──
 
-const GRID_COLS: usize = 8;
-const GRID_ROWS: usize = 3;
+const GRID_COLS: usize = 7;
+const GRID_ROWS: usize = 4;
 const SPACING: f32 = 1.8;
 const FIELD_INDEX: usize = 22;
 
@@ -274,6 +274,10 @@ fn mesh_id_for_material(mat_idx: usize) -> &'static str {
         20 => "icosphere",                // Skin
         21 => "icosphere",                // Rock
         22 => "icosphere",                // Field (placeholder for grid view)
+        23 => "plane",                    // Slash — UV plane
+        24 => "icosphere",                // Blood — sphere surface
+        25 => "plane",                    // Summon — magic circle on plane
+        26 => "icosphere",                // Aura — volumetric sphere
         _ => "cube",
     }
 }
@@ -315,6 +319,11 @@ fn build_instance(mat_idx: usize, time: f32) -> InstanceData {
         7 => (Vec3::new(1.3, 1.0, 1.3), 0.08, 0.3),  // Aurora
         14 => (Vec3::splat(0.65), 0.0, 0.0),    // Lightning — volumetric sphere
         11 => (Vec3::splat(1.8), 0.2, 0.0),    // Neon
+        // New (game-effect oriented)
+        23 => (Vec3::new(1.2, 0.9, 1.2), 0.0, 0.0),    // Slash — flat plane
+        24 => (Vec3::splat(0.55), 0.05, 0.0),           // Blood — sphere
+        25 => (Vec3::new(1.2, 1.0, 1.2), 0.05, 0.0),    // Summon — flat circle
+        26 => (Vec3::splat(0.7), 0.02, 0.0),            // Aura — volumetric
         _ => (Vec3::splat(1.0), 0.2, 0.0),
     };
 
@@ -350,6 +359,10 @@ fn build_instance(mat_idx: usize, time: f32) -> InstanceData {
         20 => (0.0, 0.4),  // Skin
         21 => (0.0, 0.9),  // Rock
         22 => (0.0, 0.8),  // Field
+        23 => (0.0, 0.4),  // Slash
+        24 => (0.0, 0.2),  // Blood (wet)
+        25 => (0.0, 0.5),  // Summon
+        26 => (0.0, 0.6),  // Aura
         _ => (0.0, 0.5),
     };
 
@@ -458,12 +471,16 @@ fn detail_scale(index: usize) -> Vec3 {
         // Field: terrain already sized at 8.0, just scale 1:1
         FIELD_INDEX => Vec3::splat(1.0),
         // Surface materials: large sphere to fill view
-        10 | 15 | 16 | 20 | 21 => Vec3::splat(2.0),
+        10 | 15 | 16 | 20 | 21 | 24 => Vec3::splat(2.0),  // Blood is a wet sphere
         // Natural shapes
         0 | 1 | 9 | 12 => Vec3::splat(1.5), // Bubble, Glass, Crystal, Shield
         2 => Vec3::splat(2.0),             // Portal
         8 => Vec3::splat(2.0),             // Hologram
         11 => Vec3::splat(2.5),            // Neon
+        // New game effects
+        23 => Vec3::new(3.0, 2.5, 3.0),    // Slash — large flat plane
+        25 => Vec3::new(3.5, 1.0, 3.5),    // Summon — flat circle (kept thin in y)
+        26 => Vec3::splat(2.0),            // Aura — volumetric sphere
         _ => Vec3::splat(2.0),
     }
 }
@@ -474,6 +491,8 @@ fn detail_camera_distance(index: usize) -> f32 {
         _ if is_landscape_material(index) => 2.5,
         5 | 6 | 14 | 19 => 6.0,
         17 | 18 => 6.0,
+        25 => 7.0,                  // Summon — flat circle viewed from above
+        23 | 26 => 6.0,             // Slash, Aura
         _ => 4.0,
     }
 }
@@ -483,6 +502,8 @@ fn detail_camera_pitch(index: usize) -> f32 {
         0.5 // Look down at the field
     } else if is_landscape_material(index) {
         0.15
+    } else if index == 25 {
+        0.85 // Summon — strong top-down so the circle reads
     } else {
         0.25
     }
@@ -1382,8 +1403,14 @@ impl SceneApp for GalleryApp {
                 let y_off = detail_y_offset(idx);
                 let is_static = is_landscape_material(idx) || idx == FIELD_INDEX;
                 let yaw = if is_static { 0.0 } else { self.time * 0.1 };
+                // Plane meshes lie on XZ. Stand them up for billboard-style effects.
+                let pitch_x = match idx {
+                    23 => std::f32::consts::FRAC_PI_2, // Slash — face the camera
+                    _ => 0.0,
+                };
                 let model = Mat4::from_translation(Vec3::new(0.0, y_off, 0.0))
                     * Mat4::from_rotation_y(yaw)
+                    * Mat4::from_rotation_x(pitch_x)
                     * Mat4::from_scale(scale);
 
                 let mat_kind = if idx == FIELD_INDEX { 21.0 } else { idx as f32 };
@@ -1399,6 +1426,8 @@ impl SceneApp for GalleryApp {
                         15 => (0.0, 0.8), 16 => (0.1, 0.15), 17 => (0.0, 0.9),
                         18 => (0.0, 0.8), 19 => (0.0, 0.7), 20 => (0.0, 0.4),
                         21 => (0.0, 0.9),
+                        23 => (0.0, 0.4), 24 => (0.0, 0.2),
+                        25 => (0.0, 0.5), 26 => (0.0, 0.6),
                         _ => (0.0, 0.5),
                     }
                 };

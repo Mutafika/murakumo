@@ -10,7 +10,7 @@ use crate::params::{self, PARAMS_PER_MATERIAL};
 
 // ── Constants ──
 
-pub const MATERIAL_COUNT: usize = 23;
+pub const MATERIAL_COUNT: usize = 27;
 const MAT_PARAMS_VEC4S: usize = MATERIAL_COUNT * 2;
 
 pub const MATERIAL_NAMES: [&str; MATERIAL_COUNT] = [
@@ -20,11 +20,17 @@ pub const MATERIAL_NAMES: [&str; MATERIAL_COUNT] = [
     "Shield", "Dissolve", "Lightning", "Lava",
     "Ice", "Cloud", "Explosion", "Tornado",
     "Skin", "Rock", "Field",
+    "Slash", "Blood", "Summon", "Aura",
 ];
 
 /// 透明マテリアルか判定（depth write 無効で描画）
 pub fn is_transparent(material_index: usize) -> bool {
-    matches!(material_index, 0 | 1 | 5 | 6 | 14 | 17 | 18 | 19)
+    // Bubble, Glass, Fire, Smoke, Lightning, Cloud, Explosion, Tornado,
+    // Slash, Blood, Summon, Aura
+    matches!(
+        material_index,
+        0 | 1 | 5 | 6 | 14 | 17 | 18 | 19 | 23 | 24 | 25 | 26
+    )
 }
 
 // ── Secondary layer instance data ──

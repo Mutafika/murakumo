@@ -39,7 +39,7 @@ var<uniform> light_data: LightUniform;
 // Per-material tunable params (shares group 1 with lights to fit
 // inside the default `max_bind_groups: 4` limit).
 struct MatParamsUniform {
-    values: array<vec4<f32>, 46>,
+    values: array<vec4<f32>, 54>,
 };
 
 @group(1) @binding(1)
@@ -2140,6 +2140,385 @@ fn mat_skin(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32) -> MaterialResul
     return r;
 }
 
+// ── 23: Slash — sword swing trail (UV plane, vertical billboard) ──
+//
+// Angle rotates the sweep direction (0=horizontal, 0.25=diagonal up-right,
+// 0.5=vertical, etc). Combo fires N strikes per cycle in quick succession,
+// each with a small vertical stagger so they don't fully overlap.
+
+fn mat_slash(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, uv: vec2<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let p_hue        = clamp(mp(23u, 0u), 0.0, 1.0);
+    let p_mode_f     = clamp(mp(23u, 1u), 0.0, 2.0);
+    let p_thickness  = max(mp(23u, 2u), 0.002);
+    let p_curve      = clamp(mp(23u, 3u), -1.0, 1.0);
+    let p_speed      = max(mp(23u, 4u), 0.0);
+    let p_length     = clamp(mp(23u, 5u), 0.05, 2.0);
+    let p_angle      = clamp(mp(23u, 6u), 0.0, 1.0);
+    let p_combo_f    = clamp(mp(23u, 7u), 1.0, 6.0);
+    let mode         = i32(floor(p_mode_f + 0.5));   // 0=Flash, 1=Hybrid, 2=Sweep
+    let strikes      = i32(floor(p_combo_f + 0.5));
+    let strikes_f    = f32(strikes);
+
+    // Center coords, rotate by -p_angle so the slash sweeps along local +x
+    let cx = uv.x - 0.5;
+    let cy = uv.y - 0.5;
+    let theta = p_angle * TAU;
+    let cs = cos(-theta);
+    let sn = sin(-theta);
+    let x = cx * cs - cy * sn;
+    let y = cx * sn + cy * cs;
+
+    // Cycle + per-strike window
+    let cycle = max(1.4 / max(p_speed, 0.05), 0.001);
+    let phase = fract(t / cycle);
+    let combo_window = 0.55;
+    let strike_window = combo_window / strikes_f;
+
+    var total = 0.0;
+    for (var i = 0; i < 6; i++) {
+        if i >= strikes { break; }
+        let i_start = f32(i) * strike_window;
+        let i_local = phase - i_start;
+        if i_local < 0.0 || i_local >= strike_window * 1.05 { continue; }
+
+        // Per-strike vertical offset so successive hits visibly stagger
+        let y_offset = (f32(i) - (strikes_f - 1.0) * 0.5) * 0.07;
+        let dy_i = (y - y_offset) - (-p_curve * (1.0 - 4.0 * x * x) * 0.3);
+
+        let core = exp(-(dy_i * dy_i) / (p_thickness * p_thickness * 0.5));
+        let glow = exp(-(dy_i * dy_i) / (p_thickness * p_thickness * 4.0)) * 0.35;
+        let arc_i = core + glow;
+
+        // Normalized progression within this strike's window (0..1).
+        let u_window = clamp(i_local / strike_window, 0.0, 1.0);
+
+        var contribution = 0.0;
+        if mode == 0 {
+            // ── Flash mode ── whole arc lights up, peak around 30% of window, then fades
+            let env = pow(1.0 - abs(u_window - 0.3) / 0.7, 2.5);
+            contribution = arc_i * env * 1.6;
+        } else if mode == 1 {
+            // ── Hybrid mode ── very fast sweep that "draws" the arc, then a full-arc flash that fades
+            // Phase 0..0.18: head races across (very fast)
+            // Phase 0..0.7:  full arc visible, brightness fades from peak to 0
+            let sweep_swing = clamp(u_window / 0.18, 0.0, 1.0);
+            let head_x = mix(-0.7, 0.7, sweep_swing);
+            let dx = head_x - x;
+            let head_glow = exp(-dx * dx * 320.0) * step(-0.05, dx);
+
+            let arc_fade = pow(1.0 - clamp(u_window / 0.85, 0.0, 1.0), 2.0);
+            // Drawing phase: only points already swept past are lit (like a pen drawing the arc)
+            let drawn = step(x - 0.02, head_x);
+            let body = arc_i * arc_fade * drawn;
+            let head_part = arc_i * head_glow * 1.8 * (1.0 - sweep_swing * 0.5);
+            contribution = body + head_part;
+        } else {
+            // ── Sweep mode ── original tracer-like sweep with trail
+            let i_swing = clamp(i_local / (strike_window * 0.7), 0.0, 1.0);
+            let head_x = mix(-0.7, 0.7, i_swing);
+            let dx = head_x - x;
+            let in_trail = step(0.0, dx);
+            let trail_lin = clamp(1.0 - dx / max(p_length, 0.001), 0.0, 1.0) * in_trail;
+            let trail = pow(trail_lin, 1.6);
+            let i_alive = step(0.0, i_local)
+                * (1.0 - smoothstep(strike_window * 0.7, strike_window, i_local));
+            let head_glow = exp(-dx * dx * 240.0) * step(-0.05, dx);
+            contribution = arc_i * (trail + head_glow * 1.6) * i_alive;
+        }
+
+        total += contribution;
+    }
+
+    let body_col = hue_color(p_hue);
+    let white_mix = smoothstep(0.6, 2.0, total);
+    let col = mix(body_col, vec3<f32>(1.0), white_mix);
+
+    r.albedo = vec3<f32>(0.0);
+    r.emission = col * total * 2.5;
+    r.metallic = 0.0;
+    r.roughness = 0.3;
+    r.alpha = clamp(total * 1.4, 0.0, 1.0);
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
+// ── 24: Blood — spraying / spurting droplets (volumetric) ──
+//
+// Particles emanate from origin in a cone of `spread` half-angle, with
+// velocity `speed` and gravity pulling them down. Each particle is a
+// small drop with a thin trail along its velocity direction. The bounding
+// sphere is a fixed radius; particles fade out beyond it or when they age.
+
+fn mat_blood(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let p_hue        = clamp(mp(24u, 0u), 0.85, 1.15);
+    let p_density    = max(mp(24u, 1u), 0.0);
+    let p_speed      = max(mp(24u, 2u), 0.05);
+    let p_spread     = clamp(mp(24u, 3u), 0.05, 1.0);
+    let p_gravity    = max(mp(24u, 4u), 0.0);
+    let p_drop       = max(mp(24u, 5u), 0.005);
+    let p_trail      = clamp(mp(24u, 6u), 0.0, 1.0);
+    let p_brightness = max(mp(24u, 7u), 0.0);
+
+    // Ray-sphere bounds (object-local sphere of radius 1.4 — particles can fly out beyond original mesh)
+    let view_dir = normalize(wp - ep);
+    let bounds_r: f32 = 1.4;
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - bounds_r * bounds_r;
+    let disc = b * b - c_val;
+    if disc < 0.0 {
+        r.albedo = vec3<f32>(0.0); r.emission = vec3<f32>(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.3; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far  = -b + sqrt_disc;
+    let march_dist = t_far - t_near;
+
+    let steps = 28;
+    let step_size = march_dist / f32(steps);
+    var transmittance = 1.0;
+    var accum = vec3<f32>(0.0);
+
+    let base_col   = hue_sat(p_hue) * vec3<f32>(0.5, 0.04, 0.05);
+    let bright_col = hue_sat(p_hue);
+
+    // Each jet draws a continuous line from origin to its current "head" along
+    // a parabolic trajectory. Two overlapping streams per jet (phase-offset by
+    // 0.5) keep visuals smooth across resets — one fading, one growing.
+    let jets = 6;
+    let life_t = 1.4;
+    let v_init = p_speed * 1.6;
+    let g = p_gravity * 3.5;
+    // Trail shapes the stream: 0=narrow whip, 1=fat sausage
+    let connect = mix(0.7, 1.6, p_trail);
+    // Subtle heartbeat pulsing
+    let pulse = 0.85 + 0.15 * sin(t * p_speed * 5.0);
+
+    for (var i = 0; i < 28; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let p = ep + view_dir * ray_t - obj_center;
+
+        var density = 0.0;
+        for (var j = 0; j < 6; j++) {
+            let fj = f32(j);
+            let theta = hash11(fj * 7.13) * TAU;
+            let cos_max = cos(p_spread * 1.45);
+            let cosp = mix(1.0, cos_max, hash11(fj * 11.7 + 0.31));
+            let sinp = sqrt(max(1.0 - cosp * cosp, 0.0));
+            let dir = vec3<f32>(cos(theta) * sinp, cosp, sin(theta) * sinp);
+
+            let jet_offset = fj * 0.137;
+
+            // Two overlapping streams per jet (staggered by 0.5 in phase)
+            for (var s = 0; s < 2; s++) {
+                let phase = fract(t * p_speed * 0.5 + jet_offset + f32(s) * 0.5);
+                let age = phase * life_t;
+                let head = dir * v_init * age
+                         - vec3<f32>(0.0, g * age * age * 0.5, 0.0);
+
+                // Distance from p to the line segment (origin → head)
+                let ab = head;
+                let ap = p;
+                let denom = max(dot(ab, ab), 1e-6);
+                let proj_t = clamp(dot(ap, ab) / denom, 0.0, 1.0);
+                let closest = ab * proj_t;
+                let d_vec = ap - closest;
+                let d2 = dot(d_vec, d_vec);
+
+                // Stream radius: thicker near origin, thin near the head;
+                // breaks up further out (smaller radius).
+                let along_norm = proj_t;  // 0 at origin, 1 at head
+                let radius_along = mix(p_drop * 1.3, p_drop * 0.5, along_norm) * connect;
+                let intensity = exp(-d2 / (radius_along * radius_along));
+
+                // Stream lifetime envelope: visible while phase 0.05..0.85
+                let env = smoothstep(0.0, 0.06, phase)
+                        * (1.0 - smoothstep(0.7, 1.0, phase));
+
+                density += intensity * env;
+            }
+        }
+
+        density = density * p_density * pulse;
+        if density > 0.001 {
+            let core_mix = smoothstep(0.5, 2.5, density);
+            let col = mix(base_col, bright_col, core_mix);
+            let extinct = density * 7.0 * step_size;
+            accum += col * density * step_size * transmittance * 4.0 * p_brightness;
+            transmittance *= exp(-extinct);
+        }
+        if transmittance < 0.02 { break; }
+    }
+
+    r.albedo = vec3<f32>(0.0);
+    r.emission = accum;
+    r.metallic = 0.0;
+    r.roughness = 0.3;
+    r.alpha = clamp((1.0 - transmittance) * 1.4, 0.0, 1.0);
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
+// ── 25: Summon — magic circle (UV plane, top-down) ──
+
+fn mat_summon(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, uv: vec2<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let p_hue        = clamp(mp(25u, 0u), 0.0, 1.0);
+    let p_rings_f    = clamp(mp(25u, 1u), 1.0, 6.0);
+    let p_rotation   = mp(25u, 2u);
+    let p_runes_f    = clamp(mp(25u, 3u), 1.0, 32.0);
+    let p_pulse      = max(mp(25u, 4u), 0.0);
+    let p_brightness = max(mp(25u, 5u), 0.0);
+    let p_beam       = max(mp(25u, 6u), 0.0);
+    let p_glow       = max(mp(25u, 7u), 0.0);
+
+    let pc = uv - 0.5;
+    let dist = length(pc) * 2.0;
+    let angle = atan2(pc.y, pc.x);
+
+    let disk = smoothstep(1.0, 0.95, dist);
+
+    let rings_n = floor(p_rings_f + 0.5);
+    let ring_phase = dist * rings_n;
+    let ring_d = abs(fract(ring_phase) - 0.5);
+    let ring_line = smoothstep(0.05, 0.0, ring_d) * smoothstep(1.0, 0.95, dist);
+
+    let rotated_angle = angle + t * p_rotation;
+    let rune_phase = (rotated_angle / TAU + 0.5) * p_runes_f;
+    let rune_id = floor(rune_phase);
+    let rune_f = fract(rune_phase);
+    let rune_band = smoothstep(0.7, 0.62, dist) * smoothstep(0.55, 0.62, dist);
+    let rune_seed = hash11(rune_id);
+    let rune_active = step(0.4, rune_seed);
+    let rune_shape = smoothstep(0.5, 0.2, abs(rune_f - 0.5));
+    let rune_pulse = 0.7 + 0.3 * sin(t * 4.0 * p_pulse + rune_id * 1.7);
+    let runes = rune_band * rune_active * rune_shape * rune_pulse;
+
+    let petal = abs(cos(rotated_angle * 6.0));
+    let petal_band = smoothstep(0.45, 0.35, dist) * smoothstep(0.15, 0.25, dist);
+    let petal_v = pow(petal, 4.0) * petal_band;
+
+    let center_glow = exp(-dist * dist * 30.0) * p_beam;
+    let mid_pulse = 0.7 + 0.3 * sin(t * 3.0 * p_pulse);
+
+    let base_col = hue_color(p_hue);
+    let bright_col = mix(base_col, vec3<f32>(1.0), 0.4);
+
+    var color = vec3<f32>(0.0);
+    color += base_col * ring_line * 1.4;
+    color += bright_col * runes * 1.6;
+    color += base_col * petal_v * 1.0;
+    color += bright_col * center_glow * 1.5 * mid_pulse;
+
+    let halo = exp(-pow(dist - 0.95, 2.0) / 0.005) * 0.7 * p_glow;
+    color += base_col * halo;
+
+    color *= p_brightness;
+
+    let lum = max(color.x, max(color.y, color.z));
+    let alpha = clamp(lum * 1.4 + ring_line * 0.6 + runes * 0.6 + center_glow * 0.6, 0.0, 1.0) * disk;
+
+    r.albedo = vec3<f32>(0.0);
+    r.emission = color * disk;
+    r.metallic = 0.0;
+    r.roughness = 0.4;
+    r.alpha = alpha;
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
+// ── 26: Aura — radiant surrounding energy (volumetric) ──
+
+fn aura_density(p: vec3<f32>, t: f32, p_density: f32, p_wave: f32) -> f32 {
+    let r2 = dot(p, p);
+    let r = sqrt(r2);
+    let shell = smoothstep(1.4, 0.85, r) * smoothstep(0.5, 0.85, r);
+
+    let phi = atan2(p.x, p.z);
+    let height = p.y;
+    let streak = sin(phi * 6.0 + t * 3.0 + height * 8.0) * 0.5 + 0.5;
+    let stream_mask = mix(1.0, streak, clamp(p_wave * 0.3, 0.0, 1.0));
+
+    let warp = vec3<f32>(
+        simplex3d(p * 1.5 + vec3<f32>(t * 0.3, 0.0, 1.7)),
+        simplex3d(p * 1.5 + vec3<f32>(0.0, t * 0.4, 4.7)),
+        simplex3d(p * 1.5 + vec3<f32>(3.1, t * 0.2, 0.0)),
+    );
+    let nn = simplex3d(p * 3.0 + warp * 0.5 + vec3<f32>(0.0, -t * 1.2, 0.0)) * 0.5 + 0.5;
+
+    return max(nn * shell * stream_mask * p_density - 0.05, 0.0) * 2.0;
+}
+
+fn mat_aura(wp: vec3<f32>, n: vec3<f32>, ep: vec3<f32>, t: f32, obj_center: vec3<f32>) -> MaterialResult {
+    var r: MaterialResult;
+    let p_hue        = clamp(mp(26u, 0u), 0.0, 1.0);
+    let p_intensity  = max(mp(26u, 1u), 0.0);
+    let p_speed      = max(mp(26u, 2u), 0.0);
+    let p_radius     = clamp(mp(26u, 3u), 0.5, 1.5);
+    let p_density    = max(mp(26u, 4u), 0.0);
+    let p_pulse      = max(mp(26u, 5u), 0.0);
+    let p_wave       = max(mp(26u, 6u), 0.0);
+    let p_brightness = max(mp(26u, 7u), 0.0);
+    let ts = t * p_speed;
+
+    let view_dir = normalize(wp - ep);
+    let oc = ep - obj_center;
+    let b = dot(oc, view_dir);
+    let c_val = dot(oc, oc) - p_radius * p_radius;
+    let disc = b * b - c_val;
+    if disc < 0.0 {
+        r.albedo = vec3<f32>(0.0); r.emission = vec3<f32>(0.0); r.alpha = 0.0;
+        r.metallic = 0.0; r.roughness = 0.5; r.normal = n; r.is_emissive_only = true;
+        return r;
+    }
+    let sqrt_disc = sqrt(disc);
+    let t_near = max(-b - sqrt_disc, 0.0);
+    let t_far  = -b + sqrt_disc;
+    let march_dist = t_far - t_near;
+
+    let steps = 28;
+    let step_size = march_dist / f32(steps);
+    var transmittance = 1.0;
+    var accum = vec3<f32>(0.0);
+
+    let main_col = hue_sat(p_hue);
+    let bright_col = mix(main_col, vec3<f32>(1.0), 0.5);
+
+    let pulse = 0.85 + 0.15 * sin(ts * 4.0 * p_pulse) * sin(ts * 2.7 * p_pulse + 1.3);
+
+    for (var i = 0; i < 28; i++) {
+        let ray_t = t_near + (f32(i) + 0.5) * step_size;
+        let p = ep + view_dir * ray_t - obj_center;
+        let d = aura_density(p, ts, p_density, p_wave);
+        if d > 0.001 {
+            let r_local = length(p);
+            let inner = smoothstep(1.0, 0.7, r_local);
+            let col = mix(main_col, bright_col, inner);
+            accum += col * d * step_size * transmittance * 4.5 * p_intensity * pulse;
+            transmittance *= exp(-d * 4.0 * step_size);
+        }
+        if transmittance < 0.02 { break; }
+    }
+
+    accum *= p_brightness;
+
+    r.albedo = vec3<f32>(0.0);
+    r.emission = accum;
+    r.metallic = 0.0;
+    r.roughness = 0.5;
+    r.alpha = clamp((1.0 - transmittance) * 1.3, 0.0, 1.0);
+    r.normal = n;
+    r.is_emissive_only = true;
+    return r;
+}
+
 // ════════════════════════════════════════════════════
 //  Fragment Shader — dispatch by kind, apply PBR
 // ════════════════════════════════════════════════════
@@ -2179,6 +2558,10 @@ fn dispatch_material(
         case 19u: { mat = mat_tornado(wp, wn, ep, t, obj_center); }
         case 20u: { mat = mat_skin(wp, wn, ep, t); }
         case 21u: { mat = mat_rock(wp, wn, ep, t); }
+        case 23u: { mat = mat_slash(wp, wn, ep, t, uv); }
+        case 24u: { mat = mat_blood(wp, wn, ep, t, obj_center); }
+        case 25u: { mat = mat_summon(wp, wn, ep, t, uv); }
+        case 26u: { mat = mat_aura(wp, wn, ep, t, obj_center); }
         default:  { mat = mat_metal(wp, wn, ep, t); }
     }
     return mat;
@@ -2209,7 +2592,7 @@ fn composite_layers(a: MaterialResult, b: MaterialResult, b_mix: f32) -> Materia
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let wp = in.world_position;
     let ep = camera.position.xyz;
-    let t = camera.position.w;  // time encoded in position.w
+    let global_t = camera.position.w;  // time encoded in position.w
     let raw_normal = normalize(in.world_normal);
     let uv = in.uv;
 
@@ -2220,6 +2603,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     } else {
         wn = raw_normal;
     }
+
+    // Time used for procedural animation. Defaults to the global
+    // camera-uniform time, but matcha-mode (material.w < -0.5)
+    // re-purposes `material.x` as a **per-instance time** in
+    // seconds — typically the burst's own age. This is what makes
+    // each Boom start at phase=0 of the Explosion shader's cycle
+    // and grow self-consistently, regardless of how many other
+    // bursts are alive or when global time started. The gallery
+    // always passes material.w ≥ 0, so it sees `global_t` and is
+    // unaffected. material.x carries `metallic` for non-matcha
+    // callers; matcha doesn't need PBR metallic so the slot is
+    // free.
+    let t = select(global_t, in.material.x, in.material.w < -0.5);
 
     // Primary material
     let k = u32(in.material.z + 0.5);
@@ -2236,8 +2632,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Override metallic/roughness from material.xy if non-emissive
-    if !mat.is_emissive_only {
+    // Override metallic/roughness from material.xy if non-emissive.
+    // Matcha-mode (material.w < -0.5) repurposes material.x as a
+    // per-instance time stamp — NOT a PBR metallic value — so skip
+    // this override there. Explosion / Aura / Lightning etc are all
+    // `is_emissive_only` materials so this branch wouldn't fire for
+    // them anyway, but the guard keeps non-emissive materials safe
+    // if matcha ever uses them.
+    let matcha_mode = in.material.w < -0.5;
+    if !mat.is_emissive_only && !matcha_mode {
         // Use instance-provided PBR params, blended with procedural
         mat.metallic = max(mat.metallic, in.material.x);
         mat.roughness = clamp(mix(mat.roughness, in.material.y, 0.5), 0.04, 1.0);
@@ -2251,7 +2654,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Apply PBR lighting
     var result = apply_pbr_lighting(mat, wp, ep);
 
-    // Atmospheric fog
+    // Per-instance colour tint. Plain multiplicative tint is identity
+    // for white (gallery default) so this affects only callers that
+    // pass a non-white `instance.color` — keeping every other consumer
+    // of MaterialPass visually unchanged.
+    result = vec4<f32>(result.rgb * in.color.rgb, result.a * in.color.a);
+
+    // Atmospheric fog — skip when `material.w < -0.5`. Hosts that
+    // place the camera far from the scene (matcha-fx puts it ~30
+    // world units back so the screen plane can span the desktop)
+    // would otherwise see the dark-blue fog colour overwhelm any
+    // material output (`exp(-30 * 0.08) ≈ 0.08`, so 92% of the
+    // pixel becomes fog). The gallery always passes ≥ 0 here, so
+    // this branch is invisible to it.
+    let skip_fog = in.material.w < -0.5;
+    if (skip_fog) {
+        return result;
+    }
     let fogged = apply_fog(result.rgb, wp, ep);
     return vec4<f32>(fogged, result.a);
 }
