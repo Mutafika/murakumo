@@ -56,7 +56,12 @@ impl LayerInstance {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[wgpu::VertexAttribute {
                 offset: 0,
-                shader_location: 11,
+                // seimei 0.3 claimed location 11 for InstanceData's
+                // `model_id`, and both layouts feed the same pipeline
+                // — sharing a location is a create_render_pipeline
+                // validation error. seimei occupies 0..=11, so 12 is
+                // the first free slot.
+                shader_location: 12,
                 format: wgpu::VertexFormat::Float32x4,
             }],
         }

@@ -165,7 +165,8 @@ struct InstanceInput {
     //   layer2.x = kind of secondary material (-1 = no layer)
     //   layer2.y = alpha mix (0..1)
     //   layer2.z, .w reserved
-    @location(11) layer2: vec4<f32>,
+    // (11 belongs to seimei's InstanceData.model_id since 0.3)
+    @location(12) layer2: vec4<f32>,
 };
 
 struct VertexOutput {
